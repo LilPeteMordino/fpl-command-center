@@ -73,7 +73,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Optional
 
-from src import config, database, optimizer, transfer_planner
+from src import chip_planner, config, database, optimizer, transfer_planner
 from src.fpl_api import FPLAPIError, fetch_vaastav_csv, fetch_vaastav_fixtures, fetch_vaastav_teams
 from src.live_tracker import get_live_gameweek_status
 from src.optimizer import OptimizationError
@@ -437,6 +437,291 @@ def _score_gameweek(conn, client, squad_ids: list, gw: int, pool_by_id: dict, ri
     return result
 
 
+# --- Double-Chip Strategy (2-set rules: WC/FH/BB/TC once per half-season) ----------------------
+# Implements the full 2-set chip rules (one Wildcard, Free Hit, Bench Boost, and Triple Captain
+# usable in each of Set 1 [GW1-19] and Set 2 [GW20-38] -- see chip_planner.CHIP_SET_1_LAST_GW,
+# reused here rather than re-declaring the boundary) so a full-season backtest reflects a real
+# manager's actual chip-augmented ceiling, not just transfers/captaincy/bench management.
+#
+# Each chip's target gameweek(s) are decided via a hybrid of two legitimate (non-lookahead)
+# sources:
+#   (1) The fixture SCHEDULE for the whole half (classify_gameweek_density) -- which gameweeks are
+#       Single/Blank/Double -- is fair game the moment that half begins, exactly like this module's
+#       existing fixture-difficulty knowledge is (see the module docstring): real fixture lists are
+#       published well in advance, only RESULTS must stay hidden.
+#   (2) A live, walk-forward check of the CURRENT squad/captain state at each schedule-flagged
+#       candidate gameweek, evaluated strictly in chronological order with no going back -- a
+#       candidate gameweek that doesn't pan out (e.g. the pre-scanned Triple Captain target no
+#       longer owns that player) is simply skipped, never retroactively "saved for later".
+#
+# Wildcard and Free Hit change WHICH players are used (see _rebuild_squad_for_target_gw); Triple
+# Captain and Bench Boost only change how that gameweek's ALREADY-DECIDED squad/lineup is SCORED
+# (applied as a post-hoc adjustment to that gameweek's gross points, never touching the transfer/
+# squad decision itself) -- this mirrors the real rules exactly (TC/BB don't affect who you pick).
+
+CHIP_CODES = ("WC", "FH", "BB", "TC")
+CHIP_NAMES = {"WC": "Wildcard", "FH": "Free Hit", "BB": "Bench Boost", "TC": "Triple Captain"}
+
+CHIP_SET1_START_GW = 2  # chips need a live, locked-in squad -- GW1 is free/unlimited squad building
+CHIP_SET1_END_GW = chip_planner.CHIP_SET_1_LAST_GW  # 19
+CHIP_SET2_START_GW = CHIP_SET1_END_GW + 1  # 20 -- CHIP_SET2_END_GW is just MAX_GAMEWEEKS (38)
+
+TC_TALISMAN_MIN_COST = optimizer.GW1_CAPTAIN_MIN_COST  # reuse the existing >= GBP 10.0m "premium" bar
+TC1_FAVORABLE_FDR = 2  # FDR at/below this counts as a "weak defense" fixture for the Set 1 SGW fallback
+
+WC1_TRIGGER_WINDOW = (6, 8)  # "around GW6-8" per spec
+WC1_ROTATION_RISK_TRIGGER = 3  # >= this many squad players below the floor triggers an early WC1
+WC1_ROTATION_FLOOR = optimizer.STARTER_SECURITY_PROFILES["balanced"]  # "regular starters lose starting status"
+
+BB1_POST_WC_OFFSET = 1  # Bench Boost 1 fires the gameweek immediately after Wildcard 1
+
+BB2_LATE_WINDOW = (28, 38)  # "largest late-season DGW (GW34/37)" -- scanned across this window
+BB2_MIN_DOUBLE_TARGET = 12  # spec's explicit bar; logged honestly even if narrowly missed (see _bb2_trigger)
+WC2_LEAD_GWS = (2, 1)  # try 2 gameweeks before the Bench Boost 2 target first, then 1
+
+
+@dataclass
+class ChipActivation:
+    chip: str  # one of CHIP_CODES
+    gw: int
+    half: int  # 1 or 2
+    detail: str  # human-readable trigger reason, surfaced in the chip log
+
+
+def classify_gameweek_density(fixtures_by_event: dict, all_team_ids: set) -> dict:
+    """Gameweek Schedule Inspector: gw -> {"team_fixture_counts": {team_id: n}, "label": "SGW"|
+    "BGW"|"DGW"}, built purely from the fixture SCHEDULE (never results) -- see this section's own
+    docstring for why that's legitimate pre-match public information, not lookahead.
+
+    label reflects the single most extreme case leaguewide that gameweek (a manager's own squad
+    composition isn't known at schedule-scan time): "BGW" if any team plays 0 times, else "DGW" if
+    any team plays >= 2 times, else "SGW". This is the shared building block every chip trigger
+    below reads from (team_fixture_counts) rather than each reimplementing its own fixture count."""
+    result = {}
+    for gw, fixtures in fixtures_by_event.items():
+        counts = {tid: 0 for tid in all_team_ids}
+        for fx in fixtures:
+            if fx["team_h"] in counts:
+                counts[fx["team_h"]] += 1
+            if fx["team_a"] in counts:
+                counts[fx["team_a"]] += 1
+        if any(c == 0 for c in counts.values()):
+            label = "BGW"
+        elif any(c >= 2 for c in counts.values()):
+            label = "DGW"
+        else:
+            label = "SGW"
+        result[gw] = {"team_fixture_counts": counts, "label": label}
+    return result
+
+
+def _rotation_risk_count(squad_rows: list) -> int:
+    """How many current squad members project below the 'balanced' Starter Security floor this
+    gameweek -- the Wildcard 1 rotation-risk trigger's own signal (see WC1_ROTATION_RISK_TRIGGER)."""
+    return sum(1 for p in squad_rows if p.xmins < WC1_ROTATION_FLOOR)
+
+
+def _half_has_dgw(gw_density: dict, start: int, end: int) -> bool:
+    return any(gw_density.get(gw, {}).get("label") == "DGW" for gw in range(start, end + 1))
+
+
+def _scan_bb2_target_gw(gw_density: dict) -> Optional[int]:
+    """Schedule-only: the gameweek in BB2_LATE_WINDOW with the most teams playing twice -- "the
+    largest late-season DGW"."""
+    best_gw, best_count = None, 0
+    for gw in range(BB2_LATE_WINDOW[0], BB2_LATE_WINDOW[1] + 1):
+        density = gw_density.get(gw)
+        if not density:
+            continue
+        double_count = sum(1 for c in density["team_fixture_counts"].values() if c >= 2)
+        if double_count > best_count:
+            best_gw, best_count = gw, double_count
+    return best_gw
+
+
+def _scan_fh_target_gw(gw_density: dict, start: int, end: int) -> Optional[int]:
+    """Schedule-only: the gameweek in [start, end] with the most teams blanking (0 fixtures) --
+    reused for both Free Hit 1 ("a blank gameweek") and Free Hit 2 ("the season's largest Blank
+    Gameweek"). None if no team ever blanks in the window."""
+    best_gw, best_count = None, 0
+    for gw in range(start, end + 1):
+        density = gw_density.get(gw)
+        if not density:
+            continue
+        blank_count = sum(1 for c in density["team_fixture_counts"].values() if c == 0)
+        if blank_count > best_count:
+            best_gw, best_count = gw, blank_count
+    return best_gw if best_count > 0 else None
+
+
+def _tc1_trigger(gw: int, gw_density: dict, half_has_dgw: bool, captain) -> Optional[str]:
+    """Triple Captain 1: if ANY Double Gameweek exists anywhere in Set 1 (schedule fact, checked
+    once up front -- see _half_has_dgw), fires the first gameweek the actual captain's own club has
+    one; otherwise falls back to the first gameweek the captain is a premium (>= TC_TALISMAN_
+    MIN_COST) talisman with a home fixture at/below TC1_FAVORABLE_FDR."""
+    team_count = gw_density.get(gw, {}).get("team_fixture_counts", {}).get(captain.team_id, 1)
+    if half_has_dgw:
+        if team_count >= 2:
+            return f"{captain.web_name}'s club has a Double Gameweek this week."
+        return None
+    if captain.now_cost >= TC_TALISMAN_MIN_COST and bool(captain.is_home) and captain.fixture_difficulty <= TC1_FAVORABLE_FDR:
+        return (
+            f"{captain.web_name} (premium, {captain.cost_millions:.1f}m) has a favorable home "
+            f"fixture (FDR {captain.fixture_difficulty:.0f}) -- no Double Gameweek anywhere in Set 1."
+        )
+    return None
+
+
+def _wc1_trigger(gw: int, squad_rows: list) -> Optional[str]:
+    """Wildcard 1: fires the first gameweek in WC1_TRIGGER_WINDOW where >= WC1_ROTATION_RISK_
+    TRIGGER current squad members project below the Starter Security floor."""
+    if not (WC1_TRIGGER_WINDOW[0] <= gw <= WC1_TRIGGER_WINDOW[1]):
+        return None
+    count = _rotation_risk_count(squad_rows)
+    if count >= WC1_ROTATION_RISK_TRIGGER:
+        return f"{count} current squad player(s) project below the Starter Security floor this week."
+    return None
+
+
+def _bb1_trigger(gw: int, squad_rows: list, wc1_activation: Optional[ChipActivation]) -> Optional[str]:
+    """Bench Boost 1: fires in GW1 if every one of the initial 15 projects a secure Starting XI
+    minutes floor, or in the gameweek immediately after Wildcard 1."""
+    if wc1_activation is not None and gw == wc1_activation.gw + BB1_POST_WC_OFFSET:
+        return f"First gameweek after the GW{wc1_activation.gw} Wildcard rebuild."
+    if gw == 1 and squad_rows and all(p.xmins >= optimizer.DEFAULT_STARTER_XMINS_FLOOR for p in squad_rows):
+        return "Every one of the initial 15 picks projects a secure Starting XI minutes floor."
+    return None
+
+
+def _fh_trigger(gw: int, target_gw: Optional[int], squad_rows: list, gw_density: dict) -> Optional[str]:
+    """Free Hit (both halves): fires at the pre-scanned peak Blank Gameweek for this half (see
+    _scan_fh_target_gw) only if the CURRENT squad actually has a player blanking that week --
+    otherwise holds (spec: "or hold for emergency fixture congestion")."""
+    if target_gw is None or gw != target_gw:
+        return None
+    counts = gw_density.get(gw, {}).get("team_fixture_counts", {})
+    blanks = [p for p in squad_rows if counts.get(p.team_id, 1) == 0]
+    if not blanks:
+        return None
+    names = ", ".join(p.web_name for p in blanks[:3])
+    suffix = "..." if len(blanks) > 3 else ""
+    return f"{len(blanks)} squad player(s) blank this Blank Gameweek ({names}{suffix})."
+
+
+def _scan_tc2_target(conn, squad_ids: list, set2_event_ids: list, gw_density: dict) -> Optional[tuple]:
+    """Pre-scans the WHOLE Set 2 window (GW20-38) for the best premium-talisman Double Gameweek
+    opportunity, projected from the squad entering Set 2 -- a legitimate forward xP PROJECTION
+    (the same mechanism transfer_planner.fetch_multi_gw_projections already uses for horizon
+    planning elsewhere), never a use of future RESULTS. Returns (event_id, player_id, detail) for
+    the single best candidate, or None if Set 2 has no Double Gameweek at all."""
+    dgw_events = [gw for gw in set2_event_ids if gw_density.get(gw, {}).get("label") == "DGW"]
+    if not dgw_events:
+        return None
+    projections = transfer_planner.fetch_multi_gw_projections(conn, dgw_events)
+    best = None
+    for pid in squad_ids:
+        proj = projections.get(pid)
+        if not proj:
+            continue
+        for gw in dgw_events:
+            if gw_density[gw]["team_fixture_counts"].get(proj["team_id"], 1) < 2:
+                continue
+            xp = proj["gw_xp"].get(gw, 0.0)
+            is_premium = proj["now_cost"] >= TC_TALISMAN_MIN_COST
+            score = xp + (1000.0 if is_premium else 0.0)  # premium strongly preferred, xP tie-breaks
+            if best is None or score > best[0]:
+                best = (score, gw, pid, proj["web_name"], xp, is_premium)
+    if best is None:
+        return None
+    _score, gw, pid, name, xp, is_premium = best
+    premium_note = " (premium)" if is_premium else ""
+    detail = f"{name}{premium_note} projects {xp:.1f} xP in a Double Gameweek (GW{gw})."
+    return gw, pid, detail
+
+
+def _tc2_trigger(gw: int, set2_plan: dict, current_squad_ids: list) -> Optional[str]:
+    if set2_plan.get("tc2_gw") != gw:
+        return None
+    if set2_plan.get("tc2_player_id") not in current_squad_ids:
+        return None  # the originally-scanned target has since left the squad -- no retroactive re-target
+    return set2_plan.get("tc2_detail")
+
+
+def _bb2_trigger(gw: int, set2_plan: dict, squad_rows: list, gw_density: dict) -> Optional[str]:
+    if set2_plan.get("bb2_gw") != gw:
+        return None
+    counts = gw_density.get(gw, {}).get("team_fixture_counts", {})
+    double_count = sum(1 for p in squad_rows if counts.get(p.team_id, 1) >= 2)
+    bar_note = "clears" if double_count >= BB2_MIN_DOUBLE_TARGET else "falls short of but is still this half's best chance at"
+    return (
+        f"Largest late-season Double Gameweek: {double_count}/15 squad players have a double "
+        f"fixture this week ({bar_note} the {BB2_MIN_DOUBLE_TARGET}-player target)."
+    )
+
+
+def _wc2_trigger(gw: int, set2_plan: dict) -> Optional[str]:
+    if set2_plan.get("wc2_gw") != gw:
+        return None
+    bb2_gw = set2_plan.get("bb2_gw")
+    return f"Building double-fixture squad depth ahead of the planned GW{bb2_gw} Bench Boost."
+
+
+def _build_set2_plan(conn, squad_ids: list, gw_density: dict) -> dict:
+    """Runs ONCE, the moment the walk-forward reaches GW20 -- pre-scans Set 2's schedule (and the
+    squad entering Set 2, for the Triple Captain 2 talisman projection) for each chip's target
+    gameweek. See _scan_tc2_target/_scan_bb2_target_gw/_scan_fh_target_gw/_wc2_trigger."""
+    set2_event_ids = list(range(CHIP_SET2_START_GW, MAX_GAMEWEEKS + 1))
+    bb2_gw = _scan_bb2_target_gw(gw_density)
+    wc2_gw = None
+    if bb2_gw is not None:
+        for lead in WC2_LEAD_GWS:
+            candidate = bb2_gw - lead
+            if CHIP_SET2_START_GW <= candidate < bb2_gw:
+                wc2_gw = candidate
+                break
+    fh2_gw = _scan_fh_target_gw(gw_density, CHIP_SET2_START_GW, MAX_GAMEWEEKS)
+    tc2 = _scan_tc2_target(conn, squad_ids, set2_event_ids, gw_density)
+    return {
+        "bb2_gw": bb2_gw,
+        "wc2_gw": wc2_gw,
+        "fh2_gw": fh2_gw,
+        "tc2_gw": tc2[0] if tc2 else None,
+        "tc2_player_id": tc2[1] if tc2 else None,
+        "tc2_detail": tc2[2] if tc2 else None,
+    }
+
+
+def _rebuild_squad_for_target_gw(conn, budget_units: int, risk_lambda: float, target_gw: Optional[int] = None) -> list:
+    """A fresh optimal 15-man squad (optimizer.solve_squad_with_captaincy) -- scored against
+    `target_gw`'s own fixtures when given (used by Wildcard 2 to deliberately build for its paired
+    Bench Boost 2 double-gameweek target, per the spec's "build optimal 15-man double-fixture
+    depth"), or the CURRENT gameweek's fixtures otherwise (Wildcard 1, and a standalone Free Hit --
+    same mechanism GW1's own squad build already uses)."""
+    if target_gw is None:
+        pool = optimizer.fetch_players(conn)
+    else:
+        projections = transfer_planner.fetch_multi_gw_projections(conn, [target_gw])
+        pool = [transfer_planner.player_row_for_gw(proj, target_gw) for proj in projections.values()]
+    return optimizer.solve_squad_with_captaincy(pool, budget=budget_units, risk_lambda=risk_lambda)
+
+
+def _apply_chip_scoring(managed: dict, scoring_squad_ids: list, chip: Optional[str]) -> float:
+    """The gross points for this gameweek, adjusted for an active TC/BB chip -- WC/FH don't need
+    an adjustment here (their effect is already baked into `managed` via which squad/lineup was
+    scored), so this is a no-op for those. TC: one more copy of the captain's raw live points
+    (2x -> 3x). BB: the whole 15-man squad's actual points count, not just the post-auto-sub
+    effective XI -- summing every squad member's own live_points already equals "Starting XI
+    (with auto-subs) + bench" once the bench counts too, so no separate auto-sub bypass is needed."""
+    if chip == "TC":
+        return managed["provisional_total_points"] + managed["captain_doubled_points"]
+    if chip == "BB":
+        all_points = sum(
+            status.live_points for pid, status in managed["player_status"].items() if pid in scoring_squad_ids
+        )
+        return all_points + managed["captain_doubled_points"]
+    return managed["provisional_total_points"]
+
+
 # --- Season report -------------------------------------------------------------------------------
 
 @dataclass
@@ -455,6 +740,7 @@ class GameweekResult:
     captain_doubled_points: float  # the extra copy actually earned (0 if the armband was wasted)
     best_possible_captain_points: float  # what that extra copy WOULD have been, captaining hindsight's actual top scorer in the (post-auto-sub) XI
     formation: str
+    chip: Optional[str] = None  # CHIP_CODES entry active this gameweek, if any -- see _apply_chip_scoring
 
 
 # Deliberately generic/season-agnostic rule-of-thumb bands -- NOT derived from any specific
@@ -497,9 +783,10 @@ class SeasonReport:
     worst_gameweeks: list = field(default_factory=list)
     gw_results: list = field(default_factory=list)
     estimated_percentile_band: str = ""
+    chip_log: list = field(default_factory=list)  # list of ChipActivation, in gameweek order
 
 
-def _build_season_report(season: str, n_gameweeks: int, gw_results: list) -> SeasonReport:
+def _build_season_report(season: str, n_gameweeks: int, gw_results: list, chip_log: Optional[list] = None) -> SeasonReport:
     total_gross = round(sum(r.managed_points for r in gw_results), 1)
     total_hit_cost = sum(r.managed_hit_cost for r in gw_results)
     total_net = round(sum(r.managed_net_points for r in gw_results), 1)
@@ -537,6 +824,7 @@ def _build_season_report(season: str, n_gameweeks: int, gw_results: list) -> Sea
         worst_gameweeks=list(reversed(ranked[-3:])) if len(ranked) >= 3 else list(reversed(ranked)),
         gw_results=gw_results,
         estimated_percentile_band=_estimate_percentile_band(total_net),
+        chip_log=sorted(chip_log or [], key=lambda c: c.gw),
     )
 
 
@@ -575,12 +863,22 @@ def simulate_season(
     meta_by_id: dict = {}
     accum_by_id: dict = {}
     gw_results: list = []
+    chip_log: list = []
 
     managed_squad_ids: list = []
     static_squad_ids: list = []
     bank = budget_units
     free_transfers = DEFAULT_FREE_TRANSFERS_AT_GW2
     final_gw = 0
+
+    # Double-Chip Strategy setup -- see that section's own docstring. The whole-season fixture
+    # SCHEDULE (never results) is known up front, so this classification and Set 1's "does any
+    # Double Gameweek exist at all" fact are computed once here rather than re-derived every week.
+    gw_density = classify_gameweek_density(fixtures_by_event, set(team_id_by_name.values()))
+    set1_has_dgw = _half_has_dgw(gw_density, CHIP_SET1_START_GW, CHIP_SET1_END_GW)
+    set1_fh_target_gw = _scan_fh_target_gw(gw_density, CHIP_SET1_START_GW, CHIP_SET1_END_GW)
+    chips_used = {1: {}, 2: {}}  # half -> {chip_code: ChipActivation}
+    set2_plan: Optional[dict] = None
 
     for gw in range(1, MAX_GAMEWEEKS + 1):
         try:
@@ -600,48 +898,151 @@ def simulate_season(
         pool = optimizer.fetch_players(conn)
         pool_by_id = {p.id: p for p in pool}
 
+        wc_activation: Optional[ChipActivation] = None
+        fh_activation: Optional[ChipActivation] = None
+        tc_activation: Optional[ChipActivation] = None
+        bb_activation: Optional[ChipActivation] = None
+        fh_scoring_squad_ids: Optional[list] = None
+
         if gw == 1:
             squad = optimizer.solve_squad_with_captaincy(pool, budget=budget_units, risk_lambda=risk_lambda)
             managed_squad_ids = [p.id for p in squad]
             static_squad_ids = list(managed_squad_ids)
             bank = budget_units - sum(p.now_cost for p in squad)
             transfers_in_ids, transfers_out_ids, hit_cost = [], [], 0
+
+            bb1_detail = _bb1_trigger(1, squad, None)
+            if bb1_detail:
+                bb_activation = ChipActivation("BB", 1, 1, bb1_detail)
+                chips_used[1]["BB"] = bb_activation
+                chip_log.append(bb_activation)
         else:
-            try:
-                roadmap = transfer_planner.plan_transfers(
-                    conn, managed_squad_ids, bank, free_transfers, horizon_gws=1,
-                    allow_hits=True, freeze_gkp_transfers=True,
-                )
-                step = roadmap[0]
-                transfers_in_ids, transfers_out_ids = step.transfers_in_ids, step.transfers_out_ids
-                hit_cost = step.hit_cost
-                bank = step.bank_remaining
-                free_transfers = min(
-                    transfer_planner.FREE_TRANSFER_CAP,
-                    max(0, free_transfers - step.transfers_made) + 1,
-                )
-                managed_squad_ids = list((set(managed_squad_ids) - set(transfers_out_ids)) | set(transfers_in_ids))
-            except OptimizationError as exc:
+            half = 1 if gw <= CHIP_SET1_END_GW else 2
+            if half == 2 and set2_plan is None:
+                set2_plan = _build_set2_plan(conn, managed_squad_ids, gw_density)
                 if verbose:
-                    print(f"[backtest] {season} GW{gw}: transfer planning failed ({exc}) -- holding squad.")
+                    plan_desc = ", ".join(f"{k}={v}" for k, v in set2_plan.items() if k.endswith("_gw"))
+                    print(f"[backtest] Set 2 chip schedule (pre-scanned at GW20): {plan_desc}")
+            used_this_half = chips_used[half]
+            squad_rows_before = [pool_by_id[pid] for pid in managed_squad_ids if pid in pool_by_id]
+
+            if "WC" not in used_this_half:
+                detail = _wc1_trigger(gw, squad_rows_before) if half == 1 else _wc2_trigger(gw, set2_plan)
+                if detail:
+                    wc_activation = ChipActivation("WC", gw, half, detail)
+
+            if wc_activation is None and "FH" not in used_this_half:
+                target_gw = set1_fh_target_gw if half == 1 else set2_plan["fh2_gw"]
+                detail = _fh_trigger(gw, target_gw, squad_rows_before, gw_density)
+                if detail:
+                    fh_activation = ChipActivation("FH", gw, half, detail)
+
+            if wc_activation is not None:
+                # Wildcard 2 deliberately builds toward its paired Bench Boost 2 double-gameweek
+                # target (see _rebuild_squad_for_target_gw); Wildcard 1 just optimizes for now.
+                wc_target_gw = set2_plan["bb2_gw"] if (half == 2 and set2_plan.get("wc2_gw") == gw) else None
+                new_squad = _rebuild_squad_for_target_gw(conn, budget_units, risk_lambda, wc_target_gw)
+                new_squad_ids = {p.id for p in new_squad}
+                old_squad_ids = {p.id for p in squad_rows_before}
+                transfers_in_ids = list(new_squad_ids - old_squad_ids)
+                transfers_out_ids = list(old_squad_ids - new_squad_ids)
+                managed_squad_ids = list(new_squad_ids)
+                bank = budget_units - sum(p.now_cost for p in new_squad)
+                hit_cost = 0
+                # Wildcard doesn't consume a free transfer, but the normal weekly FT accrual
+                # continues regardless of chip usage -- same roll-forward formula plan_transfers
+                # itself uses for a 0-transfer ("hold") week.
+                free_transfers = min(transfer_planner.FREE_TRANSFER_CAP, free_transfers + 1)
+                used_this_half["WC"] = wc_activation
+                chip_log.append(wc_activation)
+            elif fh_activation is not None:
+                # Free Hit is a ONE-WEEK-ONLY squad -- managed_squad_ids/bank are deliberately left
+                # untouched so next gameweek's decision continues from the real, pre-Free-Hit squad.
+                fh_squad = _rebuild_squad_for_target_gw(conn, budget_units, risk_lambda)
+                fh_scoring_squad_ids = [p.id for p in fh_squad]
                 transfers_in_ids, transfers_out_ids, hit_cost = [], [], 0
                 free_transfers = min(transfer_planner.FREE_TRANSFER_CAP, free_transfers + 1)
+                used_this_half["FH"] = fh_activation
+                chip_log.append(fh_activation)
+            else:
+                try:
+                    roadmap = transfer_planner.plan_transfers(
+                        conn, managed_squad_ids, bank, free_transfers, horizon_gws=1,
+                        allow_hits=True, freeze_gkp_transfers=True,
+                    )
+                    step = roadmap[0]
+                    transfers_in_ids, transfers_out_ids = step.transfers_in_ids, step.transfers_out_ids
+                    hit_cost = step.hit_cost
+                    bank = step.bank_remaining
+                    free_transfers = min(
+                        transfer_planner.FREE_TRANSFER_CAP,
+                        max(0, free_transfers - step.transfers_made) + 1,
+                    )
+                    managed_squad_ids = list((set(managed_squad_ids) - set(transfers_out_ids)) | set(transfers_in_ids))
+                except OptimizationError as exc:
+                    if verbose:
+                        print(f"[backtest] {season} GW{gw}: transfer planning failed ({exc}) -- holding squad.")
+                    transfers_in_ids, transfers_out_ids, hit_cost = [], [], 0
+                    free_transfers = min(transfer_planner.FREE_TRANSFER_CAP, free_transfers + 1)
+
+        scoring_squad_ids = fh_scoring_squad_ids if fh_scoring_squad_ids is not None else managed_squad_ids
 
         client = _StaticLiveClient(_historical_live_payload(parsed_rows))
-        managed = _score_gameweek(conn, client, managed_squad_ids, gw, pool_by_id, risk_lambda)
+        managed = _score_gameweek(conn, client, scoring_squad_ids, gw, pool_by_id, risk_lambda)
         static = _score_gameweek(conn, client, static_squad_ids, gw, pool_by_id, risk_lambda)
 
-        managed_gross = managed["provisional_total_points"]
+        # Triple Captain / Bench Boost: post-scoring only (never affects the transfer/squad
+        # decision itself -- see this feature's own docstring), and never on the same gameweek as
+        # a just-fired Wildcard/Free Hit (real FPL: only one chip per gameweek).
+        if gw != 1 and wc_activation is None and fh_activation is None:
+            half = 1 if gw <= CHIP_SET1_END_GW else 2
+            used_this_half = chips_used[half]
+            if "TC" not in used_this_half:
+                captain_row = pool_by_id.get(managed["captain_id"])
+                if captain_row is not None:
+                    detail = (
+                        _tc1_trigger(gw, gw_density, set1_has_dgw, captain_row) if half == 1
+                        else _tc2_trigger(gw, set2_plan, managed_squad_ids)
+                    )
+                    if detail:
+                        tc_activation = ChipActivation("TC", gw, half, detail)
+                        used_this_half["TC"] = tc_activation
+                        chip_log.append(tc_activation)
+            if tc_activation is None and "BB" not in used_this_half:
+                squad_rows_now = [pool_by_id[pid] for pid in scoring_squad_ids if pid in pool_by_id]
+                detail = (
+                    _bb1_trigger(gw, squad_rows_now, used_this_half.get("WC")) if half == 1
+                    else _bb2_trigger(gw, set2_plan, squad_rows_now, gw_density)
+                )
+                if detail:
+                    bb_activation = ChipActivation("BB", gw, half, detail)
+                    used_this_half["BB"] = bb_activation
+                    chip_log.append(bb_activation)
+
+        # gameweek_chip: whichever chip actually fired this week (at most one, see this feature's
+        # own docstring), for the report's chip log -- distinct from `scoring_chip`, which is only
+        # ever "TC"/"BB"/None, since WC/FH's effect is already baked into WHICH squad got scored
+        # rather than needing a separate points adjustment (see _apply_chip_scoring).
+        scoring_chip = "TC" if tc_activation else ("BB" if bb_activation else None)
+        gameweek_chip = (
+            scoring_chip or (wc_activation.chip if wc_activation else None) or (fh_activation.chip if fh_activation else None)
+        )
+        managed_gross = _apply_chip_scoring(managed, scoring_squad_ids, scoring_chip)
         managed_net = round(managed_gross - hit_cost, 1)
         static_gross = static["provisional_total_points"]
 
-        bench_all = sum(
-            managed["player_status"][pid].live_points for pid in managed["bench_ids"] if pid in managed["player_status"]
-        )
-        bench_captured = sum(
-            managed["player_status"][pid].live_points for pid in managed["bench_ids"]
-            if pid in managed["effective_starting_xi_ids"] and pid in managed["player_status"]
-        )
+        if scoring_chip == "BB":
+            # With Bench Boost active the whole 15 already counts, so nothing was "left behind".
+            bench_left_behind = 0.0
+        else:
+            bench_all = sum(
+                managed["player_status"][pid].live_points for pid in managed["bench_ids"] if pid in managed["player_status"]
+            )
+            bench_captured = sum(
+                managed["player_status"][pid].live_points for pid in managed["bench_ids"]
+                if pid in managed["effective_starting_xi_ids"] and pid in managed["player_status"]
+            )
+            bench_left_behind = round(bench_all - bench_captured, 1)
 
         xi_points = [
             managed["player_status"][pid].live_points
@@ -660,25 +1061,27 @@ def simulate_season(
             transfers_out=[pool_by_id[pid].web_name for pid in transfers_out_ids if pid in pool_by_id],
             static_points=round(static_gross, 1),
             auto_sub_moves=len(managed["auto_sub_moves"]),
-            bench_points_left_behind=round(bench_all - bench_captured, 1),
+            bench_points_left_behind=bench_left_behind,
             captain_web_name=captain_status.web_name if captain_status else "?",
             captain_points=captain_status.live_points if captain_status else 0,
             captain_doubled_points=managed["captain_doubled_points"],
             best_possible_captain_points=best_possible_top,
             formation=managed["formation"],
+            chip=gameweek_chip,
         ))
 
         if verbose:
+            chip_note = f" | CHIP: {CHIP_NAMES[gw_results[-1].chip]}" if gw_results[-1].chip else ""
             print(
                 f"[backtest] {season} GW{gw}: {managed_net:.1f} net pts "
                 f"({managed_gross:.1f} gross - {hit_cost} hit) | static benchmark {static_gross:.1f} "
-                f"| C: {gw_results[-1].captain_web_name}"
+                f"| C: {gw_results[-1].captain_web_name}{chip_note}"
             )
 
         _accumulate(accum_by_id, parsed_rows)
         final_gw = gw
 
-    return _build_season_report(season, final_gw, gw_results)
+    return _build_season_report(season, final_gw, gw_results, chip_log)
 
 
 # --- CLI reporting ---------------------------------------------------------------------------
@@ -719,6 +1122,13 @@ def format_report(report: SeasonReport) -> str:
     lines.append("-- Worst 3 Gameweeks " + "-" * 50)
     for r in report.worst_gameweeks:
         lines.append(f"  GW{r.gw:>2}: {r.managed_net_points:>6.1f} pts  (C: {r.captain_web_name}, {r.formation})")
+    lines.append("")
+    lines.append("-- Chip Log (Set 1: GW1-19, Set 2: GW20-38) " + "-" * 26)
+    if report.chip_log:
+        for c in report.chip_log:
+            lines.append(f"  GW{c.gw:>2} [Set {c.half}] {CHIP_NAMES[c.chip]:<15} {c.detail}")
+    else:
+        lines.append("  No chips fired -- no trigger condition was ever met.")
     lines.extend([
         "",
         "-" * 72,
