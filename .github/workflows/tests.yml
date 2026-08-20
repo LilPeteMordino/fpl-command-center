@@ -1,0 +1,32 @@
+name: Tests
+
+# Runs the real assertion-based regression suite (tests/) on every push and PR -- this is the
+# pytest suite from Sprint 4, not the manual print-and-eyeball scripts at the repo root
+# (test_optimizer.py / test_transfer_planner.py), which stay local-only smoke scripts.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # Matches runtime.txt -- keep both in sync when bumping.
+          python-version: "3.13"
+          cache: "pip"
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run tests
+        run: pytest tests/ -v --cov=src --cov-report=term-missing

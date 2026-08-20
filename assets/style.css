@@ -1,0 +1,678 @@
+/* ==========================================================================
+   FPL Analytics Engine -- Modern Dark Theme
+   Injected once via st.markdown(..., unsafe_allow_html=True) in app.py's main().
+   Targets Streamlit's data-testid hooks (stable across recent Streamlit versions)
+   plus a handful of custom classes used by the HTML components app.py renders
+   directly (pitch/player cards, glass cards, fixture pills/ticker).
+   ========================================================================== */
+
+:root {
+  --bg-primary: #0B0E14;
+  --bg-secondary: #151B28;
+  --bg-card: rgba(21, 27, 40, 0.72);
+  --accent-green: #00FF87;
+  --accent-cyan: #00E5FF;
+  --accent-purple: #7928CA;
+  --border-subtle: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.16);
+  --text-primary: #F5F7FA;
+  --text-secondary: #9AA4B2;
+  --radius: 12px;
+  --shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+
+/* --- App shell ----------------------------------------------------------- */
+
+.stApp,
+[data-testid="stAppViewContainer"] {
+  background: radial-gradient(circle at 15% 0%, #131826 0%, var(--bg-primary) 55%) fixed;
+  color: var(--text-primary);
+}
+
+[data-testid="stHeader"] {
+  background: transparent;
+}
+
+[data-testid="stSidebar"] {
+  background: var(--bg-secondary);
+  border-right: 1px solid var(--border-subtle);
+}
+
+[data-testid="stSidebar"] * {
+  color: var(--text-primary);
+}
+
+::-webkit-scrollbar { height: 10px; width: 10px; }
+::-webkit-scrollbar-track { background: var(--bg-secondary); }
+::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 999px; }
+::-webkit-scrollbar-thumb:hover { background: var(--accent-cyan); }
+
+h1, h2, h3, h4, h5, h6, p, span, label, li { color: var(--text-primary); }
+
+h1 {
+  background: linear-gradient(90deg, var(--accent-green), var(--accent-cyan));
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+}
+
+[data-testid="stCaptionContainer"], .stCaption, small { color: var(--text-secondary) !important; }
+
+hr, [data-testid="stDivider"] { border-color: var(--border-subtle) !important; }
+
+/* --- Metrics --------------------------------------------------------------- */
+
+[data-testid="stMetric"] {
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  box-shadow: var(--shadow);
+}
+
+[data-testid="stMetricValue"] { color: var(--accent-green); font-weight: 800; }
+[data-testid="stMetricLabel"] { color: var(--text-secondary); }
+
+/* --- Buttons ----------------------------------------------------------------*/
+
+.stButton > button, .stDownloadButton > button {
+  background: linear-gradient(135deg, rgba(0, 255, 135, 0.14), rgba(0, 229, 255, 0.10)) !important;
+  color: var(--text-primary) !important;
+  border: 1px solid var(--border-strong) !important;
+  border-radius: var(--radius) !important;
+  font-weight: 600;
+  transition: all 0.15s ease;
+  box-shadow: none;
+}
+
+.stButton > button:hover, .stDownloadButton > button:hover {
+  border-color: var(--accent-green) !important;
+  box-shadow: 0 0 0 1px var(--accent-green), 0 0 16px rgba(0, 255, 135, 0.35);
+  color: var(--accent-green) !important;
+  transform: translateY(-1px);
+}
+
+.stButton > button:active { transform: translateY(0); }
+
+/* --- Tabs, expanders, containers --------------------------------------------*/
+
+[data-testid="stExpander"] {
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle) !important;
+  border-radius: var(--radius) !important;
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+.stTabs [data-baseweb="tab-list"] { gap: 4px; border-bottom: 1px solid var(--border-subtle); }
+
+.stTabs [data-baseweb="tab"] {
+  background: transparent;
+  border-radius: 10px 10px 0 0;
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+.stTabs [aria-selected="true"] {
+  color: var(--accent-green) !important;
+  border-bottom: 2px solid var(--accent-green) !important;
+}
+
+[data-testid="stVerticalBlockBorderWrapper"] > div > [data-testid="stVerticalBlock"] {
+  gap: 0.6rem;
+}
+
+/* --- Inputs ------------------------------------------------------------------*/
+
+.stTextInput input, .stNumberInput input, .stTextArea textarea,
+[data-baseweb="select"] > div, [data-baseweb="base-input"] {
+  background: var(--bg-secondary) !important;
+  border-color: var(--border-strong) !important;
+  color: var(--text-primary) !important;
+  border-radius: 8px !important;
+}
+
+.stSlider [data-baseweb="slider"] div[role="slider"] {
+  background: var(--accent-green) !important;
+  box-shadow: 0 0 10px rgba(0, 255, 135, 0.6);
+}
+
+[data-testid="stDataFrame"] {
+  border-radius: var(--radius);
+  overflow: hidden;
+  border: 1px solid var(--border-subtle);
+}
+
+[data-testid="stFileUploaderDropzone"] {
+  background: var(--bg-secondary);
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius);
+}
+
+/* --- Alerts (info/success/warning/error) -------------------------------------*/
+
+[data-testid="stAlert"] {
+  border-radius: var(--radius);
+  border: 1px solid var(--border-subtle);
+}
+
+/* ==========================================================================
+   Pitch + player cards
+   ========================================================================== */
+
+.pitch-wrap, .st-key-pitch_wrap {
+  position: relative;
+  border-radius: 16px;
+  overflow: hidden;
+  background: linear-gradient(180deg, #134e2b 0%, #0d351d 100%);
+  padding: 26px 10px 14px;
+  box-shadow: var(--shadow);
+  border: 1px solid var(--border-subtle);
+}
+
+.pitch-markings { position: absolute; inset: 0; pointer-events: none; opacity: 0.55; }
+
+/* Card click-through: a per-player/per-sub st.container(key="pcard_<id>"/"bcard_<id>") wraps the
+   visual HTML card together with a same-size, fully transparent native st.button -- clicking
+   anywhere on the card actually clicks that button, which opens the Player Analysis dialog.
+   The wildcard attribute selector is needed since each container's key -> CSS class is unique
+   per player id. */
+[class*="st-key-pcard_"], [class*="st-key-bcard_"] {
+  position: relative;
+}
+
+[class*="st-key-pcard_"] .stButton, [class*="st-key-bcard_"] .stButton {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+}
+
+[class*="st-key-pcard_"] .stButton > button, [class*="st-key-bcard_"] .stButton > button {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  opacity: 0;
+  cursor: pointer;
+  border: none !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  padding: 0;
+}
+.pitch-halfway { position: absolute; top: 50%; left: 4%; right: 4%; border-top: 2px solid rgba(255,255,255,0.35); }
+.pitch-circle {
+  position: absolute; top: 50%; left: 50%; width: 15%; padding-top: 15%;
+  transform: translate(-50%, -50%); border: 2px solid rgba(255,255,255,0.35); border-radius: 50%;
+}
+.pitch-box-top {
+  position: absolute; top: 0; left: 26%; right: 26%; height: 15%;
+  border: 2px solid rgba(255,255,255,0.35); border-top: none;
+}
+.pitch-box-bottom {
+  position: absolute; bottom: 0; left: 26%; right: 26%; height: 15%;
+  border: 2px solid rgba(255,255,255,0.35); border-bottom: none;
+}
+
+/* Bugfix: st.container(key=...) defaults to width="stretch" -- even with width="content" now
+   set explicitly on each card container in app.py (the real fix), this is a belt-and-braces CSS
+   backstop that forces the actual Streamlit-rendered row to the exact tactical-row geometry: a
+   full-width flex row with cards centered and evenly spaced, never stacking into a column or
+   bunching unevenly (verified live pre-fix: a 5-card row rendered at uneven [142,142,142,220,
+   220]px slot widths instead of 5 even ~120px ones). Scoped to these two keyed containers only,
+   not applied globally, so it can't affect any other horizontal=True layout in the app.
+
+   No descendant-combinator space in these selectors: verified live that a keyed
+   st.container(key=..., horizontal=True) puts the key class directly ON the
+   [data-testid="stHorizontalBlock"] element itself, not on some separate ancestor wrapper --
+   `[class*="..."] [data-testid=...]` (with a space) matches nothing here. */
+[class*="st-key-pitch_row_"][data-testid="stHorizontalBlock"],
+.st-key-bench_row[data-testid="stHorizontalBlock"] {
+  display: flex !important;
+  flex-direction: row !important;
+  flex-wrap: wrap !important;
+  justify-content: space-around !important;
+  align-items: center !important;
+  width: 100% !important;
+}
+
+[class*="st-key-pitch_row_"][data-testid="stHorizontalBlock"] > [data-testid="stLayoutWrapper"],
+.st-key-bench_row[data-testid="stHorizontalBlock"] > [data-testid="stLayoutWrapper"] {
+  width: auto !important;
+  flex: 0 0 auto !important;
+}
+
+.pitch-row {
+  position: relative;
+  display: flex;
+  justify-content: space-evenly;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 16px 0;
+  flex-wrap: wrap;
+}
+
+.player-card {
+  position: relative;
+  width: 112px;
+  background: rgba(11, 14, 20, 0.58);
+  backdrop-filter: blur(6px);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 12px;
+  padding: 8px 6px 9px;
+  text-align: center;
+  color: #fff;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+  transition: transform 0.2s ease-in-out, box-shadow 0.2s ease-in-out, border-color 0.2s ease-in-out;
+  cursor: pointer;
+}
+
+.player-card:hover {
+  transform: translateY(-4px) scale(1.05);
+  z-index: 20;
+  box-shadow: 0px 8px 24px rgba(0, 255, 135, 0.3);
+  border-color: var(--accent-cyan);
+}
+
+.player-pos-tag {
+  font-size: 9.5px;
+  letter-spacing: 0.05em;
+  font-weight: 800;
+  color: #041018;
+  background: var(--accent-cyan);
+  border-radius: 6px;
+  padding: 1px 6px;
+  display: inline-block;
+  margin-bottom: 4px;
+}
+
+.captain-badge {
+  position: absolute;
+  top: -9px;
+  right: -9px;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 800;
+  color: #241a00;
+  z-index: 2;
+}
+
+.captain-badge.badge-c {
+  background: radial-gradient(circle at 30% 30%, #FFEB99, #D4AF37);
+  box-shadow: 0 0 10px 3px rgba(212, 175, 55, 0.65);
+}
+
+.captain-badge.badge-v {
+  background: radial-gradient(circle at 30% 30%, #F5F6F8, #AEB6C2);
+  box-shadow: 0 0 8px 2px rgba(174, 182, 194, 0.55);
+  color: #1c1f24;
+}
+
+.player-name {
+  font-size: 12.5px;
+  font-weight: 700;
+  margin: 2px 0 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.player-club { font-size: 9.5px; color: #C9D6E3; opacity: 0.85; margin-bottom: 4px; }
+
+.fixture-pill {
+  display: inline-block;
+  font-size: 9.5px;
+  font-weight: 800;
+  padding: 2px 7px;
+  border-radius: 999px;
+  margin: 2px 0 4px;
+}
+
+.player-stats-row { display: flex; justify-content: center; gap: 4px; margin-top: 2px; }
+
+.stat-badge {
+  background: rgba(255, 255, 255, 0.10);
+  border-radius: 6px;
+  padding: 1px 6px;
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.stat-badge.xp-badge {
+  background: rgba(0, 255, 135, 0.20);
+  color: var(--accent-green);
+  font-weight: 800;
+}
+
+/* Dedicated Captaincy Callout: the doubled-points share, shown only on the captain/vice card. */
+.captaincy-share-row {
+  margin-top: 5px;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.01em;
+  color: #241a00;
+  background: linear-gradient(90deg, #FFEB99, #D4AF37);
+  border-radius: 6px;
+  padding: 2px 4px;
+}
+
+.captaincy-share-row.captaincy-share-vice {
+  color: #1c1f24;
+  background: linear-gradient(90deg, #F5F6F8, #AEB6C2);
+}
+
+/* --- Bench strip --------------------------------------------------------- */
+
+.bench-strip-wrap {
+  display: flex;
+  gap: 10px;
+  overflow-x: auto;
+  padding: 14px 4px 6px;
+}
+
+.bench-card {
+  position: relative;
+  flex: 0 0 auto;
+  width: 104px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: 12px;
+  padding: 8px 6px;
+  text-align: center;
+  cursor: pointer;
+  transition: transform 0.2s ease-in-out, box-shadow 0.2s ease-in-out, border-color 0.2s ease-in-out;
+}
+
+.bench-card:hover {
+  transform: translateY(-3px) scale(1.05);
+  z-index: 20;
+  box-shadow: 0px 8px 24px rgba(0, 255, 135, 0.3);
+  border-color: var(--accent-cyan);
+}
+
+.bench-slot-tag {
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  color: var(--accent-purple);
+  display: block;
+  margin-bottom: 3px;
+}
+
+.bench-slot-hint {
+  font-size: 7.5px;
+  font-weight: 600;
+  letter-spacing: 0;
+  color: var(--text-secondary);
+  text-transform: none;
+}
+
+/* ==========================================================================
+   Glassmorphism action cards (Captain / Transfer)
+   ========================================================================== */
+
+.glass-card {
+  background: linear-gradient(145deg, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0.015));
+  backdrop-filter: blur(10px);
+  border: 1px solid var(--border-subtle);
+  border-radius: 16px;
+  padding: 16px 18px;
+  box-shadow: var(--shadow);
+  margin-bottom: 14px;
+}
+
+.glass-card h4 {
+  margin: 0 0 10px;
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+.captain-row { display: flex; align-items: center; gap: 12px; margin-bottom: 6px; }
+
+.captain-badge-static {
+  position: static;
+  flex: 0 0 auto;
+  width: 34px;
+  height: 34px;
+  font-size: 14px;
+}
+
+.captain-name { font-weight: 800; font-size: 16px; line-height: 1.1; }
+.captain-sub { font-size: 11.5px; color: var(--text-secondary); margin-top: 1px; }
+
+.captain-pick-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  border-top: 1px solid var(--border-subtle);
+  padding-top: 8px;
+  margin-top: 8px;
+}
+
+.transfer-pill-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 10px 0;
+  flex-wrap: wrap;
+}
+
+.transfer-name-out {
+  background: rgba(255, 71, 87, 0.16);
+  color: #FF7A88;
+  border-radius: 8px;
+  padding: 4px 10px;
+  font-weight: 700;
+  font-size: 12.5px;
+}
+
+.transfer-arrow { color: var(--accent-cyan); font-weight: 900; font-size: 14px; }
+
+.transfer-name-in {
+  background: rgba(0, 255, 135, 0.16);
+  color: var(--accent-green);
+  border-radius: 8px;
+  padding: 4px 10px;
+  font-weight: 700;
+  font-size: 12.5px;
+}
+
+.transfer-gain-badge {
+  background: var(--accent-green);
+  color: #04140B;
+  font-weight: 800;
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 11.5px;
+  margin-left: auto;
+}
+
+.transfer-meta { font-size: 10.5px; color: var(--text-secondary); width: 100%; }
+
+/* ==========================================================================
+   Daily Price Change Sentinel -- Command Center alert pill
+   ========================================================================== */
+
+.price-alert-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+
+.price-alert-pill {
+  display: block;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 7px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border-subtle);
+}
+
+.price-alert-pill.price-alert-rise {
+  background: rgba(0, 255, 135, 0.12);
+  color: var(--accent-green);
+  border-color: rgba(0, 255, 135, 0.35);
+}
+
+.price-alert-pill.price-alert-drop {
+  background: rgba(255, 71, 87, 0.12);
+  color: #FF7A88;
+  border-color: rgba(255, 71, 87, 0.35);
+}
+
+/* ==========================================================================
+   5-GW fixture ticker
+   ========================================================================== */
+
+.ticker-wrap { overflow-x: auto; }
+
+.ticker-table { width: 100%; border-collapse: separate; border-spacing: 0 6px; font-size: 12px; }
+
+.ticker-table th {
+  text-align: center;
+  font-size: 10.5px;
+  color: var(--text-secondary);
+  font-weight: 700;
+  padding: 0 6px 4px;
+}
+
+.ticker-table th:first-child { text-align: left; }
+
+.ticker-player-cell { text-align: left; white-space: nowrap; padding: 0 10px 0 4px; }
+.ticker-player-name { font-weight: 700; font-size: 12px; }
+.ticker-player-pos { font-size: 9.5px; color: var(--text-secondary); margin-left: 4px; }
+
+.ticker-cell { text-align: center; padding: 2px 3px; }
+
+.ticker-pill {
+  display: inline-block;
+  min-width: 54px;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 3px 4px;
+  border-radius: 8px;
+}
+
+/* ==========================================================================
+   Season Strategy & Chip Roadmap (GW1-19) timeline strip
+   ========================================================================== */
+
+.chip-timeline-wrap {
+  display: flex;
+  gap: 4px;
+  overflow-x: auto;
+  padding: 8px 2px 12px;
+}
+
+.chip-timeline-cell {
+  flex: 0 0 auto;
+  min-width: 38px;
+  height: 62px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  background: var(--bg-card);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  padding: 4px 2px;
+}
+
+.chip-timeline-cell-active {
+  min-width: 80px;
+  border-width: 2px;
+  box-shadow: var(--shadow);
+}
+
+.chip-timeline-gw {
+  font-size: 9px;
+  color: var(--text-secondary);
+  font-weight: 700;
+}
+
+.chip-timeline-icon { font-size: 16px; line-height: 1; }
+
+.chip-timeline-label {
+  font-size: 8.5px;
+  font-weight: 700;
+  text-align: center;
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+
+/* ==========================================================================
+   Tactical Rationale & Strategy sidebar card (Squad Optimizer / Transfer Planner)
+   ========================================================================== */
+
+.rationale-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+  margin-bottom: 14px;
+}
+
+.rationale-card-title {
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  color: var(--text-primary);
+  margin: 0 0 4px;
+}
+
+.rationale-section-title {
+  font-size: 10.5px;
+  font-weight: 800;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--accent-cyan);
+  margin: 14px 0 6px;
+}
+
+.rationale-section-title:first-of-type { margin-top: 8px; }
+
+.rationale-bullet {
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--text-primary);
+  padding: 8px 0;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.rationale-bullet:first-child { border-top: none; padding-top: 4px; }
+
+.rationale-tag-row { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 5px; }
+
+.rationale-tag {
+  display: inline-block;
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  border-radius: 999px;
+  padding: 2px 9px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.rationale-empty { font-size: 12px; color: var(--text-secondary); font-style: italic; }
+
+.rationale-transfer-pair {
+  font-size: 12.5px;
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+
+.rationale-transfer-pair .out { color: #FF7A88; }
+.rationale-transfer-pair .in { color: var(--accent-green); }

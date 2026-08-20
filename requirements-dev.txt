@@ -1,0 +1,6 @@
+# Dev-only dependencies for running the regression suite (tests/) -- not needed by the deployed
+# app itself, so kept out of requirements.txt to avoid installing test tooling in production.
+# Install alongside the app deps for local test runs: pip install -r requirements.txt -r requirements-dev.txt
+-r requirements.txt
+pytest==9.1.1
+pytest-cov==7.1.0

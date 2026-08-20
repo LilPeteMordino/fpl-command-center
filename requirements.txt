@@ -1,0 +1,13 @@
+# Pinned to the exact versions this app is developed and tested against, for reproducible
+# deploys on Streamlit Community Cloud (a fresh `pip install -r requirements.txt` on every
+# reboot/redeploy) -- an open-ended `>=` range risks silently pulling in an untested future
+# major version (pandas 3.x, plotly 6.x, and pulp 3.x are all recent major bumps from what an
+# `>=`-only file would have allowed) and breaking the app in production. Bump these deliberately,
+# together, after testing locally -- not by relaxing back to a range.
+requests==2.34.2
+urllib3==2.7.0
+pydantic==2.13.4
+pulp==3.3.2
+streamlit==1.60.0
+plotly==6.9.0
+pandas==3.0.5
