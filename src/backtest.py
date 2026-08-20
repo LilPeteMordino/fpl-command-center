@@ -741,6 +741,8 @@ class GameweekResult:
     best_possible_captain_points: float  # what that extra copy WOULD have been, captaining hindsight's actual top scorer in the (post-auto-sub) XI
     formation: str
     chip: Optional[str] = None  # CHIP_CODES entry active this gameweek, if any -- see _apply_chip_scoring
+    free_transfers_before: int = 0  # free_transfers going INTO this gameweek's decision -- lets a
+    # caller verify a Wildcard/hold rolls this forward (+1, capped) rather than consuming it
 
 
 # Deliberately generic/season-agnostic rule-of-thumb bands -- NOT derived from any specific
@@ -898,6 +900,7 @@ def simulate_season(
         pool = optimizer.fetch_players(conn)
         pool_by_id = {p.id: p for p in pool}
 
+        free_transfers_before = free_transfers  # snapshot -- see GameweekResult.free_transfers_before
         wc_activation: Optional[ChipActivation] = None
         fh_activation: Optional[ChipActivation] = None
         tc_activation: Optional[ChipActivation] = None
@@ -1068,6 +1071,7 @@ def simulate_season(
             best_possible_captain_points=best_possible_top,
             formation=managed["formation"],
             chip=gameweek_chip,
+            free_transfers_before=free_transfers_before,
         ))
 
         if verbose:
