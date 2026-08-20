@@ -2197,13 +2197,13 @@ CHIP_TIMELINE_COLORS = {
 }
 
 
-def _chip_timeline_html(recommendations: list) -> str:
-    """A 19-cell GW1-GW19 strip; a plain cell for every gameweek with no chip planned, a
-    colour-coded, wider cell (icon + chip name, hover title = the reasoning) for the gameweek(s)
-    a chip is actually recommended for."""
+def _chip_timeline_html(recommendations: list, gw_start: int, gw_end: int) -> str:
+    """A gw_start-gw_end cell strip (GW1-19 for Set 1, GW20-38 for Set 2); a plain cell for every
+    gameweek with no chip planned, a colour-coded, wider cell (icon + chip name, hover title = the
+    reasoning) for the gameweek(s) a chip is actually recommended for."""
     by_gw = {r.event_id: r for r in recommendations}
     cells = []
-    for gw in range(1, chip_planner.CHIP_SET_1_LAST_GW + 1):
+    for gw in range(gw_start, gw_end + 1):
         rec = by_gw.get(gw)
         if rec is None:
             cells.append(f'<div class="chip-timeline-cell"><span class="chip-timeline-gw">GW{gw}</span></div>')
@@ -2274,33 +2274,48 @@ def render_chip_strategy_tab(conn):
 
     st.divider()
 
-    # --- Season Strategy & Chip Roadmap (GW1-19) -----------------------------------
-    st.subheader("Season Strategy & Chip Roadmap (GW1–19)")
+    # --- Season Strategy & Chip Roadmap (Set 1: GW1-19, Set 2: GW20-38) ---------------
+    # Which set is ACTIVE (see current_set above, from the manager's real current gameweek)
+    # decides which half's planner/window/session-state key this section uses -- crossing GW19/20
+    # switches the whole section over rather than just leaving a stale GW1-19 view up with a "kept
+    # for reference only" note, as Set 1 alone used to do before Set 2 had its own planner.
+    if current_set == 1:
+        roadmap_gw_start, roadmap_gw_end = 2, chip_planner.CHIP_SET_1_LAST_GW
+        roadmap_window_label = f"GW{roadmap_gw_start}–{roadmap_gw_end}"
+        roadmap_solver = chip_planner.solve_season_half_chip_strategy
+        roadmap_spinner_text = f"Planning chip windows across {roadmap_window_label}..."
+    else:
+        roadmap_gw_start, roadmap_gw_end = chip_planner.SECOND_HALF_START_GW, chip_planner.CHIP_SET_2_LAST_GW
+        roadmap_window_label = f"GW{roadmap_gw_start}–{roadmap_gw_end}"
+        roadmap_solver = chip_planner.solve_second_half_chip_strategy
+        roadmap_spinner_text = f"Planning chip windows across {roadmap_window_label} (Bench Boost first, Wildcard timed ahead of it)..."
+    roadmap_state_key = f"macro_chip_roadmap_{set_key}"
+    roadmap_set_name = "Set 1" if current_set == 1 else "Set 2"
+
+    st.subheader(f"Season Strategy & Chip Roadmap ({roadmap_window_label})")
     st.caption(
-        "A full first-half view spreading Wildcard, Bench Boost, Triple Captain, and Free Hit "
-        "across GW1-19 at once -- distinct from the rolling-horizon roadmap below, which only "
-        "looks a few gameweeks ahead. Each chip targets its own natural window (fixture swings, "
-        "squad freshness, blank/double detection) rather than being crammed into the opening "
-        "gameweeks; the toggles above (which chips are already used) decide what's still in play."
+        f"A full {roadmap_set_name} view spreading Wildcard, Bench Boost, Triple Captain, and Free Hit "
+        f"across {roadmap_window_label} at once -- distinct from the rolling-horizon roadmap below, which "
+        "only looks a few gameweeks ahead. Each chip targets its own natural window (fixture swings, "
+        "squad freshness, blank/double detection) rather than being crammed into the opening gameweeks; "
+        "the toggles above (which chips are already used) decide what's still in play."
     )
-    if current_set != 1:
-        st.info("Set 1 has already expired (GW20+) -- this planner is kept for reference only.")
 
     macro_available_chips = [code for code in chip_planner.CHIP_CODES if not used_flags[code]]
     if not macro_available_chips:
-        st.caption("All Set 1 chips are marked used above -- nothing left to plan.")
-    elif st.button("Build Season Roadmap"):
+        st.caption(f"All {roadmap_set_name} chips are marked used above -- nothing left to plan.")
+    elif st.button("Build Season Roadmap", key=f"build_roadmap_{set_key}"):
         try:
-            with st.spinner("Planning chip windows across GW1-19..."):
-                st.session_state.macro_chip_roadmap = chip_planner.solve_season_half_chip_strategy(
+            with st.spinner(roadmap_spinner_text):
+                st.session_state[roadmap_state_key] = roadmap_solver(
                     conn, squad_ids, available_chips=macro_available_chips,
                 )
         except OptimizationError as exc:
             st.error(str(exc))
 
-    macro_roadmap = st.session_state.get("macro_chip_roadmap")
+    macro_roadmap = st.session_state.get(roadmap_state_key)
     if macro_roadmap:
-        st.markdown(_chip_timeline_html(macro_roadmap), unsafe_allow_html=True)
+        st.markdown(_chip_timeline_html(macro_roadmap, roadmap_gw_start, roadmap_gw_end), unsafe_allow_html=True)
         for rec in macro_roadmap:
             icon = CHIP_TIMELINE_ICONS.get(rec.chip, "")
             confidence_note = (
@@ -2312,7 +2327,8 @@ def render_chip_strategy_tab(conn):
         missing = [code for code in macro_available_chips if code not in planned_chips]
         if missing:
             st.caption(
-                f"No confident GW1-19 window found for: {', '.join(chip_planner.CHIP_NAMES[c] for c in missing)}."
+                f"No confident {roadmap_window_label} window found for: "
+                f"{', '.join(chip_planner.CHIP_NAMES[c] for c in missing)}."
             )
 
     st.divider()

@@ -566,6 +566,211 @@ def solve_season_half_chip_strategy(
     return recommendations
 
 
+# --- Second-half (GW20-38) macro chip roadmap -------------------------------------
+# Mirrors solve_season_half_chip_strategy's overall shape (per-chip candidate lists, then a
+# greedy priority pass resolving gameweek collisions), but Set 2's own chip windows work on
+# fundamentally different signals than Set 1's:
+#   - Triple Captain 2 targets the single highest-xP Double Gameweek, premium talismans preferred
+#     -- no "favorable SGW" fallback the way TC1 has, since a genuine DGW is what Set 2's own
+#     spec calls for specifically.
+#   - Bench Boost 2 targets whichever gameweek the most of the CURRENT squad's own players double
+#     -- "largest late-season DGW" in practice, since that's where real fixture congestion
+#     produces doubles, but this scans the whole window handed to it rather than hardcoding an
+#     absolute late-season GW range, so it still behaves sensibly if called mid-way through Set 2.
+#   - Wildcard 2's dependency direction is the REVERSE of Set 1's WC-then-BB chain: Set 1's
+#     Bench Boost can be timed off an already-chosen Wildcard, but Set 2's Wildcard is instead
+#     timed 1-2 gameweeks AHEAD of an already-chosen Bench Boost (to build squad depth toward
+#     it) -- so Bench Boost 2 is resolved first here, Wildcard 2 second.
+#   - Free Hit 2 reuses _fh_macro_candidates as-is: "the season's largest Blank Gameweek" is
+#     already exactly what that function's own blanks+doubles-ranked-descending candidate list
+#     naturally picks first once handed Set 2's window instead of Set 1's.
+#
+# Real Double/Blank Gameweeks for the run-in are typically confirmed even later than Set 1's own
+# already-documented uncertainty (see _fh_macro_candidates) -- often not until domestic cup
+# replays and European ties are locked in, sometimes as late as January/February. Finding no
+# genuine double/blank yet in the published fixture list is the expected, honest outcome for
+# most of the season, not a bug -- see each function's own placeholder fallback below.
+
+CHIP_SET_2_LAST_GW = 38  # last gameweek of the season / Set 2's own window
+SECOND_HALF_START_GW = CHIP_SET_1_LAST_GW + 1  # 20 -- Set 2 begins the gameweek after Set 1 expires
+WC2_LEAD_GWS = (2, 1)  # try 2 gameweeks before the Bench Boost 2 target first, then 1
+BB2_MIN_SQUAD_DOUBLE_TARGET = 12  # spec's explicit bar; reported honestly even if narrowly missed
+
+
+def _tc2_macro_candidates(squad_ids: list, projections: dict, event_ids: list) -> list:
+    """Every squad player's Double Gameweek opportunity in the window, ranked premium
+    (now_cost >= optimizer.GW1_CAPTAIN_MIN_COST, the same "premium talisman" bar the GW1
+    Pre-Season Cold-Start Anchor and the backtester's own TC2 logic both use) first, then by
+    that gameweek's summed (both-leg) xP -- "the highest-xP Double Gameweek for a premium
+    talisman", with a genuine non-premium double still surfaced (clearly labeled) rather than
+    silently discarded if no premium player happens to double."""
+    candidates = []
+    for pid in squad_ids:
+        proj = projections.get(pid)
+        if not proj:
+            continue
+        for event_id in event_ids:
+            if proj["gw_fixture_count"].get(event_id, 1) < 2:
+                continue
+            xp = proj["gw_xp"].get(event_id, 0.0)
+            is_premium = proj["now_cost"] >= optimizer.GW1_CAPTAIN_MIN_COST
+            premium_note = " (premium)" if is_premium else ""
+            candidates.append({
+                "event_id": event_id,
+                "reason": (
+                    f"{proj['web_name']}{premium_note} projects {xp:.1f} xP in a Double "
+                    f"Gameweek (GW{event_id})."
+                ),
+                "score": xp + (1000.0 if is_premium else 0.0),  # premium strongly preferred, xP tie-breaks
+                "data_driven": True,
+            })
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+    return candidates
+
+
+def _bb2_macro_candidates(squad_ids: list, projections: dict, event_ids: list) -> list:
+    """Ranks gameweeks by how many of the CURRENT squad's own 15 players have a double fixture
+    that week -- "the largest late-season DGW ... where >= 12 squad members play twice". Falls
+    back to a single calendar placeholder (data_driven=False) at the end of the window, same
+    convention as _fh_macro_candidates, when no double is visible anywhere yet."""
+    candidates = []
+    for event_id in event_ids:
+        double_count = sum(
+            1 for pid in squad_ids
+            if pid in projections and projections[pid]["gw_fixture_count"].get(event_id, 1) >= 2
+        )
+        if double_count == 0:
+            continue
+        bar_note = (
+            "clears" if double_count >= BB2_MIN_SQUAD_DOUBLE_TARGET
+            else "falls short of but is still this window's best chance at"
+        )
+        candidates.append({
+            "event_id": event_id,
+            "reason": (
+                f"GW{event_id}: {double_count}/{len(squad_ids)} squad players have a double "
+                f"fixture ({bar_note} the {BB2_MIN_SQUAD_DOUBLE_TARGET}-player target)."
+            ),
+            "score": double_count,
+            "data_driven": True,
+        })
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+    if not candidates and event_ids:
+        fallback_gw = event_ids[-1]
+        candidates.append({
+            "event_id": fallback_gw,
+            "reason": (
+                "No Double Gameweek is visible yet in the currently-published fixture list -- "
+                f"reserved at GW{fallback_gw} (end of this window) as a placeholder; revisit "
+                "once the run-in schedule firms up."
+            ),
+            "score": 0,
+            "data_driven": False,
+        })
+    return candidates
+
+
+def _wc2_macro_candidates(event_ids: list, bb2_event_id: Optional[int]) -> list:
+    """Wildcard 2 is timed 1-2 gameweeks AHEAD of the already-chosen Bench Boost 2 target, to
+    build the double-fixture squad depth Bench Boost 2 needs -- the reverse dependency direction
+    from Set 1's WC-then-BB chain (see this section's own module comment). No candidates at all
+    if Bench Boost 2 itself never found a real target."""
+    if bb2_event_id is None:
+        return []
+    candidates = []
+    for lead in WC2_LEAD_GWS:
+        candidate_gw = bb2_event_id - lead
+        if candidate_gw not in event_ids:
+            continue
+        candidates.append({
+            "event_id": candidate_gw,
+            "reason": (
+                f"Building double-fixture squad depth {lead} gameweek(s) ahead of the planned "
+                f"GW{bb2_event_id} Bench Boost."
+            ),
+            "score": -lead,  # prefer the 2-gw lead time over the 1-gw one when both are available
+            "data_driven": True,
+        })
+    return candidates
+
+
+def solve_second_half_chip_strategy(
+    conn,
+    squad_ids: list,
+    gw_start: int = SECOND_HALF_START_GW,
+    gw_end: int = CHIP_SET_2_LAST_GW,
+    available_chips: Optional[list] = None,
+) -> list:
+    """Assigns each available chip to a single non-conflicting gameweek across the second-half
+    (Set 2, GW20-38) window -- the direct Set 2 counterpart to solve_season_half_chip_strategy,
+    see this section's own module comment for exactly how each chip's window logic differs from
+    Set 1's. Bench Boost is resolved before Wildcard here (the reverse of Set 1's order), since
+    Wildcard 2's own timing depends on Bench Boost 2's chosen gameweek, not the other way round.
+
+    available_chips: which chips to plan for, e.g. omit any already used this season -- pass a
+    plain list of the still-available codes from CHIP_CODES ("WC", "FH", "BB", "TC").
+
+    Returns a list of MacroChipRecommendation, one per chip that found any viable gameweek in the
+    window (a chip with no qualifying candidate anywhere is simply omitted rather than forcing a
+    low-confidence pick), sorted by event_id.
+    """
+    available_chips = list(available_chips) if available_chips is not None else list(CHIP_CODES)
+    start = max(gw_start, SECOND_HALF_START_GW)
+    end = min(gw_end, CHIP_SET_2_LAST_GW)
+    if start > end:
+        return []
+
+    event_ids = [
+        row["id"] for row in conn.execute(
+            "SELECT id FROM gameweeks WHERE id >= ? AND id <= ? ORDER BY id", (start, end)
+        ).fetchall()
+    ]
+    if not event_ids:
+        return []
+    projections = transfer_planner.fetch_multi_gw_projections(conn, event_ids)
+
+    candidate_lists = {}
+    if "TC" in available_chips:
+        candidate_lists["TC"] = _tc2_macro_candidates(squad_ids, projections, event_ids)
+    if "FH" in available_chips:
+        candidate_lists["FH"] = _fh_macro_candidates(squad_ids, projections, event_ids)
+
+    taken_gws: set = set()
+    recommendations = []
+
+    def assign(chip: str, candidates: list) -> Optional[int]:
+        for candidate in candidates:
+            event_id = candidate["event_id"]
+            if event_id in taken_gws:
+                continue
+            taken_gws.add(event_id)
+            recommendations.append(
+                MacroChipRecommendation(
+                    chip=chip, event_id=event_id, reasoning=candidate["reason"],
+                    data_driven=candidate.get("data_driven", True),
+                )
+            )
+            return event_id
+        return None
+
+    bb2_event_id = None
+    if "BB" in available_chips:
+        candidate_lists["BB"] = _bb2_macro_candidates(squad_ids, projections, event_ids)
+        bb2_event_id = assign("BB", candidate_lists["BB"])
+
+    if "WC" in available_chips:
+        candidate_lists["WC"] = _wc2_macro_candidates(event_ids, bb2_event_id)
+        assign("WC", candidate_lists["WC"])
+
+    if "TC" in candidate_lists:
+        assign("TC", candidate_lists["TC"])
+    if "FH" in candidate_lists:
+        assign("FH", candidate_lists["FH"])
+
+    recommendations.sort(key=lambda r: r.event_id)
+    return recommendations
+
+
 # --- "What-if" single-chip simulator --------------------------------------------
 
 def simulate_chip(conn, squad_ids: list, chip: str, event_id: Optional[int] = None) -> dict:
