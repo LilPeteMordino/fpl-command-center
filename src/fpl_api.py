@@ -233,6 +233,18 @@ def fetch_vaastav_players_raw(season: Optional[str] = None, session: Optional[re
     return fetch_vaastav_csv(url, session)
 
 
+def fetch_vaastav_fixtures(season: Optional[str] = None, session: Optional[requests.Session] = None) -> list:
+    """The full season's fixture list (see config.VAASTAV_FIXTURES_CSV_TEMPLATE) -- used by
+    src/backtest.py to reconstruct a historical season's gameweek-by-gameweek fixture difficulty
+    without any live API access. Not used by the live-data sync fallback path (sync_all_with_fallback
+    intentionally leaves fixtures/gameweeks stale when the official API is unreachable -- see the
+    module docstring above sync_teams_from_vaastav_fallback -- since a *current* season's fixture
+    list still needs the official API's own event/gameweek ids to be meaningful for the live app;
+    a finished historical season has no such ambiguity)."""
+    url = config.VAASTAV_FIXTURES_CSV_TEMPLATE.format(season=season or current_fpl_season())
+    return fetch_vaastav_csv(url, session)
+
+
 def sync_teams_from_vaastav_fallback(conn: sqlite3.Connection, season: Optional[str] = None) -> int:
     """Populate the teams table from the vaastav fallback. Returns the number of rows ingested;
     rows that fail validation are skipped (logged by the caller), not fatal."""

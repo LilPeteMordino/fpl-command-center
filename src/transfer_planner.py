@@ -39,9 +39,12 @@ from src.optimizer import (
     calculate_baseline_xmins,
     calculate_positional_xp,
     calculate_team_xp,
+    captaincy_candidates,
+    captaincy_score,
     ensemble_from_sources,
     has_set_piece_duty,
     is_before_gw1_deadline,
+    is_cold_start_pool,
     is_vice_eligible,
     set_piece_label,
     solve_squad,
@@ -63,6 +66,14 @@ LOOKAHEAD_WEIGHTS = (1.0, 0.5, 0.25)  # weight given to this gw and the followin
 # t" comparison would otherwise produce. A hurdle > 0 also structurally guarantees a transfer is
 # never taken for a net projected gain <= 0.0 xP, without a separate zero-check.
 DEFAULT_TRANSFER_HURDLE_XP = 1.5
+
+# A SEPARATE, stricter hurdle specifically for a candidate that actually spends a hit (t exceeds
+# that gameweek's free_transfers_before) -- a -4 is a much bigger, much more irreversible cost than
+# simply not banking a free transfer, so it's gated far more strictly than the plain hold-vs-
+# transfer hurdle above. Compared against the same already-hit-cost-net decision_score margin
+# DEFAULT_TRANSFER_HURDLE_XP uses (see plan_transfers) -- i.e. a hit-taking move needs its raw
+# projected gain to clear HIT_COST + this margin, not just this margin alone.
+HIT_TRANSFER_HURDLE_XP = 4.5
 
 GKP_FREEZE_INJURY_THRESHOLD = 50  # chance_of_playing_next_round below this lifts the GKP freeze
 ANTI_CHURN_MIN_GAP_GWS = 4  # a sold player can't be bought back until at least this many GWs later
@@ -249,7 +260,7 @@ def fetch_multi_gw_projections(conn, event_ids: list, ensemble_weights: Optional
         baseline_xmins = calculate_baseline_xmins(raw_stats, games_played_by_team.get(row["team_id"], 0))
         custom_xmins = adjustment.get("custom_xmins_override") if adjustment else None
 
-        gw_xp, gw_difficulty, gw_has_fixture, gw_fixture_count, gw_breakdown, gw_xmins = {}, {}, {}, {}, {}, {}
+        gw_xp, gw_difficulty, gw_has_fixture, gw_fixture_count, gw_breakdown, gw_xmins, gw_is_home = {}, {}, {}, {}, {}, {}, {}
         for event_id in event_ids:
             present_xmins = xmins_sources_by_player_event.get((row["id"], event_id), {})
             ensemble_xmins = ensemble_from_sources(present_xmins, ensemble_weights, baseline=None)
@@ -261,6 +272,9 @@ def fetch_multi_gw_projections(conn, event_ids: list, ensemble_weights: Optional
             legs = fixtures_by_team_event.get((row["team_id"], event_id), [])
             gw_has_fixture[event_id] = bool(legs)
             gw_fixture_count[event_id] = len(legs)
+            # Double gameweeks OR their legs together -- one home leg is enough to read as "home"
+            # for the Talisman Penalty-Taker captaincy boost (see optimizer._is_talisman_boost_favorable).
+            gw_is_home[event_id] = any(leg.is_home for leg in legs) if legs else None
             if legs:
                 leg_breakdowns = [_venue_scaled_breakdown(raw_stats, leg) for leg in legs]
                 internal_total = round(sum(b.total for b in leg_breakdowns), 3)
@@ -324,6 +338,7 @@ def fetch_multi_gw_projections(conn, event_ids: list, ensemble_weights: Optional
             "gw_fixture_count": gw_fixture_count,
             "gw_breakdown": gw_breakdown,
             "gw_xmins": gw_xmins,
+            "gw_is_home": gw_is_home,
         }
     return projections
 
@@ -359,6 +374,7 @@ def player_row_for_gw(proj: dict, event_id: int) -> PlayerRow:
         starts=proj["starts"], chance_of_playing_next_round=proj["chance_of_playing_next_round"],
         penalties_order=proj["penalties_order"], corners_order=proj["corners_order"],
         xmins=proj["gw_xmins"][event_id],
+        is_home=proj["gw_is_home"][event_id],
     )
 
 
@@ -437,13 +453,22 @@ def _solve_transfer_squad(
 
 
 def captain_pick_for_gw(starting_xi: list):
-    """Captain = the Starting XI player with the highest projected_xp; Vice = the highest-xP
-    starter (other than the captain) that clears the Vice-Captain Lock (is_vice_eligible),
-    falling back to the plain second-highest if nobody in the XI clears it -- mirrors
-    optimizer.get_captain_recommendations exactly, see its docstring for the full reasoning.
-    Plain xP otherwise, no attacker-ceiling boost (removed -- that signal isn't needed on top of
-    an already fixture/minutes-aware xP figure)."""
-    ranked = sorted(starting_xi, key=lambda p: p.projected_xp, reverse=True)
+    """Captain = the highest optimizer.captaincy_score among captaincy-eligible starters (see
+    optimizer.is_captaincy_eligible -- MID/FWD always, DEF only with confirmed penalty/corner
+    duty, GKP never -- and, during a GW1 Pre-Season Cold-Start window,
+    optimizer.captaincy_candidates further restricts the field to premium-priced or
+    standout-projection candidates only). Vice = the highest-scoring eligible starter (other than
+    the captain) that ALSO clears the Vice-Captain Lock (is_vice_eligible), falling back to the
+    plain runner-up if nobody clears it. Mirrors optimizer.get_captain_recommendations exactly --
+    see its docstring for the full reasoning. A legal Starting XI always has >= 3 base-eligible
+    MID/FWD (the formation floor guarantees it), so the eligible pool here can never come back
+    empty."""
+    cold_start = is_cold_start_pool(starting_xi)
+    eligible_ids = captaincy_candidates(starting_xi)
+    ranked = sorted(
+        (p for p in starting_xi if p.id in eligible_ids),
+        key=lambda p: captaincy_score(p, cold_start), reverse=True,
+    )
     captain = ranked[0]
     eligible_vice = [p for p in ranked[1:] if is_vice_eligible(p)]
     vice = eligible_vice[0] if eligible_vice else ranked[1]
@@ -523,6 +548,7 @@ def plan_transfers(
     min_starter_xmins: Optional[float] = None,
     freeze_gkp_transfers: bool = True,
     transfer_hurdle_xp: float = DEFAULT_TRANSFER_HURDLE_XP,
+    hit_transfer_hurdle_xp: float = HIT_TRANSFER_HURDLE_XP,
     chip_active_event_ids: Optional[set] = None,
 ) -> list:
     """ILP-driven multi-gameweek transfer roadmap.
@@ -538,7 +564,11 @@ def plan_transfers(
     before GW1's deadline isn't a "transfer" in the FPL sense at all):
       - Hurdle rate: a transfer (free or paid) only executes when its net projected gain over
         simply holding clears `transfer_hurdle_xp` -- otherwise the free transfer rolls. This also
-        structurally guarantees a transfer is never taken for a net gain <= 0.0 xP.
+        structurally guarantees a transfer is never taken for a net gain <= 0.0 xP. A candidate
+        that actually SPENDS a hit (its transfer count exceeds that gameweek's free transfers, so
+        hit_cost > 0) must clear the separate, stricter `hit_transfer_hurdle_xp` on that SAME
+        already-hit-cost-net margin instead -- a -4 is a much bigger, more irreversible cost than
+        simply not banking a free transfer, so unnecessary hit churn is gated far more strictly.
       - GKP freeze ("Set-and-Forget"): the squad's goalkeeper(s) are locked out of routine
         transfers unless injured/suspended or a Wildcard/Free Hit is active -- see
         `freeze_gkp_transfers`/`chip_active_event_ids`/_locked_gkp_ids.
@@ -635,11 +665,16 @@ def plan_transfers(
                 }
 
             # Hurdle rate: only a candidate whose margin over holding clears transfer_hurdle_xp is
-            # eligible to be picked over t=0 -- see plan_transfers' docstring.
+            # eligible to be picked over t=0 -- see plan_transfers' docstring. A candidate that
+            # actually spends a hit (hit_cost > 0, i.e. t exceeds that gameweek's free transfers)
+            # must clear the separate, stricter hit_transfer_hurdle_xp on that same margin instead.
             baseline_score = candidates[0]["decision_score"]
             eligible = [
                 c for t, c in candidates.items()
-                if t == 0 or (c["decision_score"] - baseline_score) >= transfer_hurdle_xp
+                if t == 0 or (
+                    (c["decision_score"] - baseline_score)
+                    >= (hit_transfer_hurdle_xp if c["hit_cost"] > 0 else transfer_hurdle_xp)
+                )
             ]
             best = max(eligible, key=lambda c: c["decision_score"])
 

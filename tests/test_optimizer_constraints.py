@@ -9,12 +9,17 @@ import pytest
 
 from src.optimizer import (
     FORMATION_CHOICES,
+    GW1_CAPTAIN_MIN_COST,
     MAX_PLAYERS_PER_TEAM,
     SQUAD_POSITION_COUNTS,
     VICE_CAPTAIN_XMINS_FLOOR,
     OptimizationError,
     _formation_label,
     _is_hard_excluded,
+    captaincy_candidates,
+    captaincy_score,
+    is_captaincy_eligible,
+    is_cold_start_pool,
     is_vice_eligible,
     order_bench,
     parse_formation_lock,
@@ -219,3 +224,160 @@ def test_solve_squad_honors_locked_and_excluded_ids(synthetic_pool):
     squad_ids = {p.id for p in squad}
     assert lock_id in squad_ids
     assert exclude_id not in squad_ids
+
+
+# --- Captaincy Position & Talisman Filtering -------------------------------------------------------
+
+def test_is_captaincy_eligible_positions():
+    gkp = make_player(1, 1, 1, cost=50, xp=5.0)
+    def_no_duty = make_player(2, 2, 1, cost=55, xp=5.0)
+    def_penalty_taker = make_player(3, 2, 1, cost=55, xp=5.0, penalties_order=1)
+    def_corner_taker = make_player(4, 2, 1, cost=55, xp=5.0, corners_order=1)
+    mid = make_player(5, 3, 1, cost=55, xp=5.0)
+    fwd = make_player(6, 4, 1, cost=55, xp=5.0)
+
+    assert not is_captaincy_eligible(gkp)
+    assert not is_captaincy_eligible(def_no_duty)
+    assert is_captaincy_eligible(def_penalty_taker)
+    assert is_captaincy_eligible(def_corner_taker)
+    assert is_captaincy_eligible(mid)
+    assert is_captaincy_eligible(fwd)
+
+
+def test_gkp_with_penalty_duty_is_still_never_captaincy_eligible():
+    # penalties_order == 1 clears the gate for a DEF, but GKP has no such carve-out at all.
+    gkp_pens = make_player(1, 1, 1, cost=50, xp=5.0, penalties_order=1)
+    assert not is_captaincy_eligible(gkp_pens)
+
+
+def test_is_vice_eligible_requires_captaincy_position_too():
+    def_high_minutes = make_player(
+        1, 2, 1, cost=55, xp=5.0, xmins=VICE_CAPTAIN_XMINS_FLOOR, chance_of_playing_next_round=100,
+    )
+    assert not is_vice_eligible(def_high_minutes)  # DEF, no set-piece duty -- fails the position gate first
+
+    def_with_duty = make_player(
+        2, 2, 1, cost=55, xp=5.0, xmins=VICE_CAPTAIN_XMINS_FLOOR, chance_of_playing_next_round=100,
+        penalties_order=1,
+    )
+    assert is_vice_eligible(def_with_duty)
+
+
+# --- Talisman Penalty-Taker boost -------------------------------------------------------------------
+
+def test_captaincy_score_boosts_favorable_penalty_taker_only():
+    baseline = make_player(1, 4, 1, cost=90, xp=8.0, fixture_difficulty=3.0)
+    favorable_easy_fdr = make_player(2, 4, 1, cost=90, xp=8.0, penalties_order=1, fixture_difficulty=2.0)
+    favorable_home = make_player(3, 4, 1, cost=90, xp=8.0, penalties_order=1, fixture_difficulty=4.0, is_home=True)
+    unfavorable = make_player(4, 4, 1, cost=90, xp=8.0, penalties_order=1, fixture_difficulty=4.0, is_home=False)
+
+    assert captaincy_score(baseline) == pytest.approx(8.0)
+    assert captaincy_score(favorable_easy_fdr) == pytest.approx(8.0 * 1.15)
+    assert captaincy_score(favorable_home) == pytest.approx(8.0 * 1.15)
+    assert captaincy_score(unfavorable) == pytest.approx(8.0)  # penalty taker, but tough away fixture
+
+
+# --- GW1 Pre-Season Cold-Start Anchor ----------------------------------------------------------------
+
+def test_is_cold_start_pool():
+    cold = [make_player(1, 3, 1, cost=90, xp=8.0, starts=0), make_player(2, 4, 1, cost=90, xp=8.0, starts=0)]
+    warm = [make_player(1, 3, 1, cost=90, xp=8.0, starts=0), make_player(2, 4, 1, cost=90, xp=8.0, starts=5)]
+    assert is_cold_start_pool(cold)
+    assert not is_cold_start_pool(warm)
+    assert not is_cold_start_pool([])
+
+
+def test_captaincy_candidates_no_restriction_outside_cold_start():
+    premium = make_player(1, 4, 1, cost=GW1_CAPTAIN_MIN_COST, xp=6.0, starts=5)
+    cheap = make_player(2, 3, 2, cost=45, xp=1.0, starts=5)
+    ids = captaincy_candidates([premium, cheap])
+    assert ids == {premium.id, cheap.id}
+
+
+def test_captaincy_candidates_restricts_to_premium_or_top_n_during_cold_start():
+    premium = make_player(1, 4, 1, cost=GW1_CAPTAIN_MIN_COST, xp=6.0, starts=0)
+    mid_a = make_player(2, 3, 2, cost=45, xp=5.5, starts=0)
+    mid_b = make_player(3, 3, 3, cost=45, xp=5.0, starts=0)
+    mid_c = make_player(4, 3, 4, cost=45, xp=4.5, starts=0)  # 4th-best, not premium -- excluded
+    mid_d = make_player(5, 3, 5, cost=45, xp=4.0, starts=0)  # 5th-best, not premium -- excluded
+    ids = captaincy_candidates([premium, mid_a, mid_b, mid_c, mid_d])
+    assert premium.id in ids
+    assert mid_a.id in ids
+    assert mid_b.id in ids
+    assert mid_c.id not in ids
+    assert mid_d.id not in ids
+
+
+# --- get_captain_recommendations integration ----------------------------------------------------------
+
+def _fake_conn_with_squad(squad):
+    class _FakeConn:
+        pass
+
+    import src.optimizer as optimizer_module
+
+    original_fetch_players = optimizer_module.fetch_players
+    optimizer_module.fetch_players = lambda conn, ensemble_weights=None: squad
+    return _FakeConn(), optimizer_module, original_fetch_players
+
+
+def test_get_captain_recommendations_never_picks_gkp_even_with_highest_raw_xp():
+    from src.optimizer import get_captain_recommendations
+
+    squad = [
+        make_player(1, 1, 1, cost=55, xp=15.0, xmins=90),  # GKP with an absurd raw xP -- never captain
+        make_player(2, 1, 2, cost=40, xp=2.0, xmins=90),
+        make_player(3, 2, 1, cost=45, xp=4.0, xmins=90),
+        make_player(4, 2, 2, cost=45, xp=3.5, xmins=90),
+        make_player(5, 2, 3, cost=45, xp=3.0, xmins=90),
+        make_player(6, 2, 4, cost=45, xp=2.5, xmins=90),
+        make_player(7, 2, 5, cost=40, xp=2.0, xmins=90),
+        make_player(8, 3, 1, cost=90, xp=8.0, xmins=90),  # expected captain: top eligible scorer
+        make_player(9, 3, 2, cost=60, xp=6.0, xmins=90, chance_of_playing_next_round=100),
+        make_player(10, 3, 3, cost=55, xp=5.5, xmins=90, chance_of_playing_next_round=100),
+        make_player(11, 3, 4, cost=50, xp=4.0, xmins=90),
+        make_player(12, 3, 5, cost=45, xp=3.5, xmins=90),
+        make_player(13, 4, 1, cost=70, xp=4.5, xmins=90),
+        make_player(14, 4, 2, cost=55, xp=3.5, xmins=90),
+        make_player(15, 4, 3, cost=45, xp=3.0, xmins=90),
+    ]
+    fake_conn, optimizer_module, original = _fake_conn_with_squad(squad)
+    try:
+        rec = get_captain_recommendations(fake_conn, [p.id for p in squad])
+    finally:
+        optimizer_module.fetch_players = original
+
+    assert rec["captain"]["player"].id == 8
+    assert rec["captain"]["player"].element_type in (3, 4)
+
+
+def test_get_captain_recommendations_gw1_cold_start_prefers_premium_over_marginal_cheap_edge():
+    from src.optimizer import get_captain_recommendations
+
+    # Every player has starts=0 -- a genuine GW1 cold start. The cheap MID (id=8) has a very
+    # slightly higher raw xP than the premium MID (id=9) purely from pre-season noise -- without
+    # the cold-start anchor's price boost, this cheap punt would win the armband outright.
+    squad = [
+        make_player(1, 1, 1, cost=45, xp=3.0, xmins=90, starts=0),
+        make_player(2, 1, 2, cost=40, xp=2.5, xmins=90, starts=0),
+        make_player(3, 2, 1, cost=45, xp=4.0, xmins=90, starts=0),
+        make_player(4, 2, 2, cost=45, xp=3.5, xmins=90, starts=0),
+        make_player(5, 2, 3, cost=45, xp=3.0, xmins=90, starts=0),
+        make_player(6, 2, 4, cost=45, xp=2.5, xmins=90, starts=0),
+        make_player(7, 2, 5, cost=40, xp=2.0, xmins=90, starts=0),
+        make_player(8, 3, 1, cost=45, xp=6.05, xmins=90, starts=0),  # cheap punt, marginally highest raw xP
+        make_player(9, 3, 2, cost=100, xp=6.0, xmins=90, starts=0),  # premium -- should win via cold-start anchor
+        make_player(10, 3, 3, cost=55, xp=5.5, xmins=90, starts=0),
+        make_player(11, 3, 4, cost=50, xp=4.0, xmins=90, starts=0),
+        make_player(12, 3, 5, cost=45, xp=3.5, xmins=90, starts=0),
+        make_player(13, 4, 1, cost=70, xp=4.5, xmins=90, starts=0),
+        make_player(14, 4, 2, cost=55, xp=3.5, xmins=90, starts=0),
+        make_player(15, 4, 3, cost=45, xp=3.0, xmins=90, starts=0),
+    ]
+    fake_conn, optimizer_module, original = _fake_conn_with_squad(squad)
+    try:
+        rec = get_captain_recommendations(fake_conn, [p.id for p in squad])
+    finally:
+        optimizer_module.fetch_players = original
+
+    assert rec["captain"]["player"].id == 9

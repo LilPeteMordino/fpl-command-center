@@ -140,7 +140,13 @@ STARTER_SECURITY_PROFILES = {
     "balanced": 60.0,
     "aggressive": 45.0,
 }
-DEFAULT_STARTER_XMINS_FLOOR = STARTER_SECURITY_PROFILES["balanced"]
+# The system-level fallback floor for any caller that doesn't explicitly choose a Starter Security
+# profile (app.py's sidebar always does -- see its STARTER_SECURITY_OPTIONS/_min_starter_xmins --
+# so this only actually governs callers like src/backtest.py that have no user-facing profile
+# control of their own). Deliberately pinned to "conservative" (75 mins), not "balanced": a caller
+# with no explicit risk tolerance of its own should default to the safer, lower-rotation-risk
+# reading rather than a middling one.
+DEFAULT_STARTER_XMINS_FLOOR = STARTER_SECURITY_PROFILES["conservative"]
 SUB1_XMINS_FLOOR = 60.0  # the bench's first outfield sub should be a real, minutes-secure player
 
 CHANCE_OF_PLAYING_DEFAULT = 100  # null in the API means "no fitness doubt", i.e. fully available
@@ -228,6 +234,112 @@ HARD_EXCLUDE_STATUSES = ("i", "s", "u")  # injured, suspended, unavailable (e.g.
 # leave almost no real vice candidates ever eligible, which isn't a usable outcome.
 VICE_CAPTAIN_XMINS_FLOOR = 85.0
 
+# --- Captaincy Position & Talisman Filtering ---------------------------------------------------
+# Real managers essentially never hand the armband to a goalkeeper or a purely defensive
+# centre-back -- both have a far lower scoring ceiling than a MID/FWD, and the rare "huge
+# defensive haul" upside doesn't come close to compensating on expectation. This is a hard
+# eligibility gate on the armband itself (captain AND vice -- see is_vice_eligible), layered on
+# TOP OF (not instead of) is_vice_eligible's own xMins/fitness floor: a player can clear that
+# floor and still never be a captaincy CANDIDATE at all if they fail this gate.
+CAPTAINCY_ELIGIBLE_POSITIONS = (3, 4)  # MID, FWD -- always eligible.
+# A DEF only clears the gate as an "attacking wing-back with a set-piece monopoly" proxy -- the
+# data model has no direct wing-back/attacking-role field, so confirmed primary penalty or
+# corner/free-kick duty stands in for it (a defender entrusted with either is, by definition, part
+# of their side's primary attacking unit, not a pure stopper). GKP is never eligible under any
+# condition.
+CAPTAINCY_ELIGIBLE_DEF_REQUIRES_SET_PIECE_DUTY = True
+
+# Talisman Penalty-Taker boost: a confirmed primary penalty taker (penalties_order == 1) gets a
+# ranking bonus for the CAPTAINCY decision specifically -- a strict tie-breaker/nudge applied only
+# to c[]/v[] scoring (mirrors CAPTAIN_XP_BONUS_MULTIPLIER/VICE_XP_INSURANCE_WEIGHT's own scope),
+# never to squad or Starting XI selection itself, and never a hard eligibility requirement on its
+# own (a non-penalty-taker MID/FWD remains fully eligible, just unboosted).
+TALISMAN_PENALTY_BOOST = 0.15
+TALISMAN_FAVORABLE_FDR = 2  # FDR <= this (or a home fixture) counts as "favorable" for the boost.
+
+# --- GW1 Pre-Season Cold-Start Anchor -----------------------------------------------------------
+# Before a single gameweek of real season data exists, every per-90 rate is 0.0 league-wide (see
+# the "Pre-season DEFCON fallback" section above) -- projected_xp at that point is driven almost
+# entirely by the flat appearance-floor term plus whatever fallback heuristics apply, a much
+# weaker signal than a real in-season projection. Left alone, this can let a cheap defensive-role
+# punt's fallback score edge out a genuine big-name attacker purely on noise. During that window
+# (see is_cold_start_pool), captaincy_candidates additionally restricts the field to premium-priced
+# or standout-projection MID/FWD only -- but ONLY as a post-hoc restriction on an already-decided
+# Starting XI (get_captain_recommendations/transfer_planner.captain_pick_for_gw), never as a hard
+# MILP constraint: the XI is only 11 players and always contains >= 3 base-eligible MID/FWD (the
+# formation floor guarantees it), so the restriction can never be infeasible there. Applying it
+# inside _solve_lineup_milp itself -- where the *candidate pool* can be the full 600+ player
+# universe or an as-yet-undecided squad -- would risk zeroing out c[]/v[] for literally every
+# player who ends up actually selected/started, since "top-3 by score across the whole universe"
+# has no guarantee of overlapping with a budget-constrained optimal squad at all. The MILP gets
+# only a SOFT nudge instead (GW1_COLD_START_PRICE_BONUS, folded into captaincy_score) -- enough to
+# meaningfully steer the joint solve toward a premium pick without ever risking infeasibility.
+GW1_CAPTAIN_MIN_COST = 100  # GBP 10.0m -- the "premium talisman" price floor.
+GW1_COLD_START_PRICE_BONUS = 0.20  # soft captaincy-ranking nudge for a premium-priced candidate
+# during the cold-start window (used by captaincy_score, NOT a hard MILP gate -- see above).
+GW1_COLD_START_TOP_N = 3  # size of the "standout pre-season projection" fallback pool alongside
+# the price floor, when captaincy_candidates applies the hard post-hoc restriction.
+
+
+def is_captaincy_eligible(player) -> bool:
+    """Position/talisman gate for the armband (captain AND vice) -- see the constant block above.
+    GKP is never eligible. MID/FWD are always eligible. DEF is eligible only with confirmed
+    primary penalty or corner/free-kick duty."""
+    if player.element_type in CAPTAINCY_ELIGIBLE_POSITIONS:
+        return True
+    if player.element_type == 2 and CAPTAINCY_ELIGIBLE_DEF_REQUIRES_SET_PIECE_DUTY:
+        return player.penalties_order == 1 or player.corners_order == 1
+    return False
+
+
+def _is_talisman_boost_favorable(player) -> bool:
+    """True for a confirmed primary penalty taker at home or facing an easy fixture (FDR <=
+    TALISMAN_FAVORABLE_FDR) -- see captaincy_score. "Home" reads PlayerRow.is_home when the caller
+    has populated it (fetch_players does); FDR alone still applies when it hasn't (None)."""
+    if player.penalties_order != 1:
+        return False
+    return bool(player.is_home) or player.fixture_difficulty <= TALISMAN_FAVORABLE_FDR
+
+
+def is_cold_start_pool(pool: list) -> bool:
+    """True when literally every candidate in `pool` has zero cumulative starts -- the state
+    that's only ever true before a single gameweek of this season has been played (`starts`
+    accumulates from GW1 onward; any nonzero value anywhere signals real season data already
+    exists). Detected from the candidates' own PlayerRow.starts rather than needing DB/gameweek
+    context threaded in, so this stays a pure function of whatever pool is passed to it -- see the
+    GW1 Pre-Season Cold-Start Anchor block above. Public (not underscore-prefixed) since
+    transfer_planner.captain_pick_for_gw also needs it."""
+    return bool(pool) and all(p.starts == 0 for p in pool)
+
+
+def captaincy_score(player, cold_start: bool = False) -> float:
+    """projected_xp, boosted for a favorably-placed primary penalty taker (TALISMAN_PENALTY_BOOST)
+    and, when `cold_start` is True, for a premium-priced candidate (GW1_COLD_START_PRICE_BONUS) --
+    used to RANK captaincy candidates only, never to rank squad/XI selection itself and never to
+    gate eligibility on its own (see is_captaincy_eligible/captaincy_candidates for the actual
+    gates). Public since transfer_planner.captain_pick_for_gw also needs it."""
+    boost = TALISMAN_PENALTY_BOOST if _is_talisman_boost_favorable(player) else 0.0
+    if cold_start and player.now_cost >= GW1_CAPTAIN_MIN_COST:
+        boost += GW1_COLD_START_PRICE_BONUS
+    return round(player.projected_xp * (1 + boost), 4)
+
+
+def captaincy_candidates(pool: list) -> set:
+    """The set of player ids eligible to hold the captain OR vice-captain armband from `pool` --
+    is_captaincy_eligible's base position/talisman gate, always applied first. When `pool` is
+    itself a GW1 Pre-Season Cold-Start pool (is_cold_start_pool), the gate additionally narrows to
+    premium-priced candidates (now_cost >= GW1_CAPTAIN_MIN_COST) OR the top GW1_COLD_START_TOP_N by
+    captaincy_score among the base-eligible pool -- see the GW1 Pre-Season Cold-Start Anchor block
+    above for why this is only ever applied post-hoc to an already-decided Starting XI (safe: a
+    legal XI always has >= 3 base-eligible MID/FWD), never as a hard _solve_lineup_milp constraint.
+    Public since transfer_planner.captain_pick_for_gw also needs it."""
+    base_eligible = [p for p in pool if is_captaincy_eligible(p)]
+    if not is_cold_start_pool(pool):
+        return {p.id for p in base_eligible}
+    premium = {p.id for p in base_eligible if p.now_cost >= GW1_CAPTAIN_MIN_COST}
+    top_n = sorted(base_eligible, key=lambda p: captaincy_score(p, cold_start=True), reverse=True)[:GW1_COLD_START_TOP_N]
+    return premium | {p.id for p in top_n}
+
 
 class OptimizationError(RuntimeError):
     """Raised when an ILP model is infeasible or the solver fails to find an optimal solution."""
@@ -278,6 +390,9 @@ class PlayerRow:
     news: str = ""  # FPL's own free-text status note, e.g. "Knee injury - Expected back 01 Sep"
     penalties_order: Optional[int] = None  # 1 = primary penalty taker, None = not on the list
     corners_order: Optional[int] = None  # 1 = primary corners/indirect-FK taker, None = not on the list
+    is_home: Optional[bool] = None  # True/False for the target gameweek's fixture (None = unknown/
+    # no fixture) -- feeds the Talisman Penalty-Taker captaincy boost's "home fixture" condition
+    # (see _is_talisman_boost_favorable); not used anywhere else in the model.
 
     @property
     def cost_millions(self) -> float:
@@ -328,6 +443,23 @@ def _team_fixture_difficulties(conn, event_id: Optional[int]) -> dict:
         difficulties.setdefault(row["team_h"], []).append(row["team_h_difficulty"] or NEUTRAL_FIXTURE_DIFFICULTY)
         difficulties.setdefault(row["team_a"], []).append(row["team_a_difficulty"] or NEUTRAL_FIXTURE_DIFFICULTY)
     return difficulties
+
+
+def _team_home_fixture(conn, event_id: Optional[int]) -> dict:
+    """team_id -> True if ANY of that team's fixture(s) this gameweek is at home (double gameweeks
+    OR their legs together, so a team with one home and one away leg still reads as home -- a
+    talisman's home-fixture captaincy boost shouldn't be denied just because their away leg is
+    listed second). Feeds PlayerRow.is_home / _is_talisman_boost_favorable; {} for no fixture
+    data at all for the target gameweek."""
+    home_by_team: dict = {}
+    if event_id is None:
+        return home_by_team
+    rows = conn.execute("SELECT team_h, team_a FROM fixtures WHERE event = ?", (event_id,)).fetchall()
+    for row in rows:
+        home_by_team[row["team_h"]] = True
+        if row["team_a"] not in home_by_team:
+            home_by_team[row["team_a"]] = False
+    return home_by_team
 
 
 def ensemble_from_sources(present: dict, weights: dict, baseline: Optional[float] = None) -> Optional[float]:
@@ -696,6 +828,7 @@ def fetch_players(conn, ensemble_weights: Optional[dict] = None) -> list:
     ensemble_weights = ensemble_weights or DEFAULT_ENSEMBLE_WEIGHTS
     event_id = _get_target_event_id(conn)
     difficulties = _team_fixture_difficulties(conn, event_id)
+    home_by_team = _team_home_fixture(conn, event_id)
     ensemble_xp_by_player = _ensemble_xp_lookup(conn, event_id, ensemble_weights)
     xmins_ensemble_by_player = _xmins_ensemble_lookup(conn, event_id, ensemble_weights)
     games_played_by_team = team_games_played(conn)
@@ -745,6 +878,7 @@ def fetch_players(conn, ensemble_weights: Optional[dict] = None) -> list:
             news=row["news"] or "",
             penalties_order=row["penalties_order"],
             corners_order=row["corners_order"],
+            is_home=home_by_team.get(row["team_id"]),
         )
         breakdown = calculate_positional_xp(player, avg_difficulty if has_fixture else NEUTRAL_FIXTURE_DIFFICULTY)
         ensemble_xp = ensemble_xp_by_player.get(player.id)
@@ -912,10 +1046,14 @@ def _is_hard_excluded(p) -> bool:
 
 def is_vice_eligible(p) -> bool:
     """True if a player satisfies the Vice-Captain Lock -- see the constant block above for why
-    null is treated as equivalent to chance_of_playing_next_round == 100 here. Public (not
-    underscore-prefixed) since transfer_planner.captain_pick_for_gw also needs it -- matching the
-    established convention of promoting a helper to a public name once a second module needs it
-    (see xgi_per_90, has_set_piece_duty, set_piece_label)."""
+    null is treated as equivalent to chance_of_playing_next_round == 100 here. Also requires
+    is_captaincy_eligible (the Captaincy Position & Talisman gate): the armband -- captain AND
+    vice alike -- never goes to a GKP or a non-set-piece-duty DEF, no matter how safe their
+    minutes are. Public (not underscore-prefixed) since transfer_planner.captain_pick_for_gw also
+    needs it -- matching the established convention of promoting a helper to a public name once a
+    second module needs it (see xgi_per_90, has_set_piece_duty, set_piece_label)."""
+    if not is_captaincy_eligible(p):
+        return False
     xmins = getattr(p, "xmins", 90.0)
     chance = getattr(p, "chance_of_playing_next_round", None)
     return xmins >= VICE_CAPTAIN_XMINS_FLOOR and (chance is None or chance == CHANCE_OF_PLAYING_DEFAULT)
@@ -1015,10 +1153,17 @@ def _solve_lineup_milp(
     c_i/v_i are real decision variables during the solve -- their bonus contribution has to be
     able to influence which players get selected as starters in the first place, which is the
     entire point of this rewrite -- but aren't returned: given the OPTIMAL Starting XI, the
-    optimal captain/vice are provably just the top-2 by projected_xp within it (the objective's
-    c/v terms are monotonic in xP with no coupling to anything else), so
-    get_captain_recommendations/captain_pick_for_gw's existing "top-2 in the XI" logic already
-    recovers them correctly with no changes needed there.
+    optimal captain/vice are provably just the top-2 by captaincy_score among is_captaincy_eligible
+    candidates within it (the objective's c/v terms are monotonic in captaincy_score, gated by the
+    same hard eligibility constraint applied here, with no coupling to anything else), so
+    get_captain_recommendations/captain_pick_for_gw's own equivalent eligible-and-scored ranking
+    already recovers them correctly with no further changes needed there. The one acknowledged
+    asymmetry: the GW1 Cold-Start Anchor's "premium OR top-N" refinement (captaincy_candidates) is
+    a pool-composition-dependent computation this function only ever applies as a SOFT scoring
+    nudge (via cold_start/c_score above), while get_captain_recommendations/captain_pick_for_gw
+    apply it as a hard restriction -- scoped to the already-decided Starting XI there, where (unlike
+    here, pre-solve, over a squad/universe that hasn't been chosen yet) it's provably always
+    non-empty. See captaincy_candidates' own docstring.
 
     Bench allocation is a deliberate Two-Stage design, not part of this objective:
       - Step 1 (here): a Sub 1 Security Constraint requires at least one outfield squad member
@@ -1054,10 +1199,17 @@ def _solve_lineup_milp(
         return 1 if squad_fixed else x[pid]
 
     eo_scores = _effective_ownership_scores(pool)
+    # Captaincy Position & Talisman Filtering / GW1 Pre-Season Cold-Start Anchor (see the constant
+    # block above is_captaincy_eligible): cold_start is a soft signal here (folds into
+    # captaincy_score's price nudge, via c_score/v_score below) -- the harder "premium OR top-N"
+    # cold-start restriction only ever applies post-hoc, to an already-decided Starting XI (see
+    # captaincy_candidates' docstring for why doing it here would risk infeasibility).
+    cold_start = is_cold_start_pool(pool)
+    c_score = {p.id: captaincy_score(p, cold_start) for p in pool}
 
     objective = pulp.lpSum(s[p.id] * p.projected_xp for p in pool)
-    objective += CAPTAIN_XP_BONUS_MULTIPLIER * pulp.lpSum(c[p.id] * p.projected_xp for p in pool)
-    objective += VICE_XP_INSURANCE_WEIGHT * pulp.lpSum(v[p.id] * p.projected_xp for p in pool)
+    objective += CAPTAIN_XP_BONUS_MULTIPLIER * pulp.lpSum(c[p.id] * c_score[p.id] for p in pool)
+    objective += VICE_XP_INSURANCE_WEIGHT * pulp.lpSum(v[p.id] * c_score[p.id] for p in pool)
     if risk_lambda:
         objective += risk_lambda * pulp.lpSum(s[p.id] * eo_scores.get(p.id, 0.0) for p in pool)
     prob += objective
@@ -1086,6 +1238,14 @@ def _solve_lineup_milp(
         prob += c[p.id] <= s[p.id]
         prob += v[p.id] <= s[p.id]
         prob += c[p.id] + v[p.id] <= 1
+        # Captaincy Position & Talisman Filtering: the BASE position/set-piece gate is a hard
+        # constraint here (always feasible -- a legal Starting XI's formation floor guarantees
+        # >= 3 base-eligible MID/FWD candidates regardless of formation_lock). The stricter
+        # cold-start-only "premium or top-N" restriction is deliberately NOT enforced here -- see
+        # the cold_start/c_score comment above and captaincy_candidates' docstring.
+        if not is_captaincy_eligible(p):
+            prob += c[p.id] == 0
+            prob += v[p.id] == 0
 
     # Starting XI formation: 1 GKP always, plus either the default flexible outfield bounds
     # (3-5 DEF, 2-5 MID, 1-3 FWD) or, when formation_lock pins a specific shape (e.g. "3-5-2"),
@@ -1215,28 +1375,33 @@ def get_captain_recommendations(
     risk_lambda: float = 0.0,
     formation_lock: Optional[str] = None,
 ) -> dict:
-    """Captain = the Starting XI player with the highest projected_xp; Vice = the highest-xP
-    Starting XI player (other than the captain) that clears the Vice-Captain Lock
-    (is_vice_eligible: xMins >= VICE_CAPTAIN_XMINS_FLOOR and chance_of_playing_next_round in
-    (None, 100)) -- falling back to the plain second-highest-xP starter if nobody in the XI
-    clears that bar, so a vice pick is still always returned. Deliberately plain otherwise -- no
-    minutes/fixture/attacker-ceiling multiplier layered on top (an earlier version of this
-    function did; removed as redundant now that both signals already live upstream of
-    projected_xp: minutes risk via the xMins "Effective xP" scaling and the min_starter_xmins hard
-    floor -- see fetch_players/solve_starting_xi -- and fixture ease via calculate_positional_xp's
-    own fixture-aware terms). risk_lambda and formation_lock (see RISK_PROFILE_LAMBDA/
-    FORMATION_CHOICES) are passed straight through to solve_starting_xi -- either can change WHICH
-    11 are in the XI (and so who's eligible here), but the top-by-xP captain pick within that XI
-    is unaffected by either directly (see _solve_lineup_milp's docstring for why).
+    """Captain = the highest captaincy_score among captaincy-eligible Starting XI players (see
+    is_captaincy_eligible: MID/FWD always, DEF only with confirmed penalty/corner duty, GKP never
+    -- and, during a GW1 Pre-Season Cold-Start window, captaincy_candidates further restricts the
+    field to premium-priced or standout-projection candidates only, see its own docstring). Vice =
+    the highest-scoring eligible Starting XI player (other than the captain) that ALSO clears the
+    Vice-Captain Lock (is_vice_eligible: xMins >= VICE_CAPTAIN_XMINS_FLOOR and
+    chance_of_playing_next_round in (None, 100)) -- falling back to the plain runner-up if nobody
+    in the XI clears that bar, so a vice pick is still always returned. captaincy_score is plain
+    projected_xp plus a talisman boost for a favorably-placed confirmed penalty taker (and, during
+    a cold start, a premium-price nudge) -- minutes/fixture risk are already priced in upstream of
+    projected_xp itself (the xMins "Effective xP" scaling and the min_starter_xmins hard floor --
+    see fetch_players/solve_starting_xi -- and calculate_positional_xp's own fixture-aware terms),
+    so no separate multiplier for either is layered on again here. risk_lambda and formation_lock
+    (see RISK_PROFILE_LAMBDA/FORMATION_CHOICES) are passed straight through to solve_starting_xi --
+    either can change WHICH 11 are in the XI (and so who's eligible here), but the top-scoring
+    captain pick within that XI is unaffected by either directly (see _solve_lineup_milp's
+    docstring for why).
 
-    Only Starting XI players are eligible: you can't captain someone who isn't playing, so a
-    squad member left on the bench -- whether by formation choice or a minutes-security exclusion
-    -- is never a candidate here (an earlier version of this function scored the whole 15-man
-    squad, including the bench, which could recommend captaining someone who wasn't even
-    starting that gameweek).
+    Only Starting XI players are eligible at all: you can't captain someone who isn't playing, so
+    a squad member left on the bench -- whether by formation choice or a minutes-security
+    exclusion -- is never a candidate here (an earlier version of this function scored the whole
+    15-man squad, including the bench, which could recommend captaining someone who wasn't even
+    starting that gameweek). A legal Starting XI always has >= 3 base-eligible MID/FWD (the
+    formation floor guarantees it), so the eligible pool here can never come back empty.
 
     Also returns a high-ownership 'safe' pick and a low-ownership 'differential' pick, both still
-    ranked by the same plain xP, for extra context beyond the raw top two.
+    ranked by the same captaincy_score, for extra context beyond the raw top two.
     """
     players = fetch_players(conn, ensemble_weights=ensemble_weights)
     squad = [p for p in players if p.id in squad_ids]
@@ -1247,7 +1412,12 @@ def get_captain_recommendations(
         squad, min_starter_xmins=min_starter_xmins, risk_lambda=risk_lambda, formation_lock=formation_lock,
     )
 
-    scored = [{"player": p, "captain_score": p.projected_xp} for p in starting_xi]
+    cold_start = is_cold_start_pool(starting_xi)
+    eligible_ids = captaincy_candidates(starting_xi)
+    scored = [
+        {"player": p, "captain_score": captaincy_score(p, cold_start)}
+        for p in starting_xi if p.id in eligible_ids
+    ]
     scored.sort(key=lambda c: c["captain_score"], reverse=True)
 
     overall_best = scored[0]
@@ -1270,8 +1440,9 @@ def get_captain_recommendations(
             top_picks.append(candidate)
             seen_ids.add(candidate["player"].id)
 
-    # Vice-Captain Lock: prefer the highest-xP eligible non-captain starter; fall back to the
-    # plain second-highest if nobody in the XI clears the eligibility bar (see is_vice_eligible).
+    # Vice-Captain Lock: prefer the highest-scoring eligible non-captain starter; fall back to the
+    # plain runner-up if nobody clears the (xMins + captaincy-position) eligibility bar (see
+    # is_vice_eligible).
     eligible_vice = [
         c for c in scored if c["player"].id != overall_best["player"].id and is_vice_eligible(c["player"])
     ]

@@ -173,3 +173,113 @@ def test_allow_hits_false_never_exceeds_free_transfers(transfer_db):
     for step in roadmap:
         assert step.transfers_made <= step.free_transfers_before
         assert step.hit_cost == 0
+
+
+# --- Stricter hit-only transfer hurdle (HIT_TRANSFER_HURDLE_XP) -----------------------------------
+# A separate, deliberately self-contained fixture (not transfer_db) so each test can control
+# exactly which single upgrade candidate is available -- with both a modest and a big upgrade in
+# the same pool simultaneously, the ILP always just picks the objectively-better one, which would
+# make "the modest one specifically gets blocked" unobservable.
+
+def _build_hit_hurdle_db(upgrade_xg: float, upgrade_xa: float, upgrade_web_name: str):
+    """Same team/gameweek/fixture/squad shape as transfer_db (see its own docstring for why the
+    FWD loop is offset), but with exactly ONE pool-only alternative to WeakMid -- verified live
+    (see the commit introducing this fixture) that (xg=0.6, xa=0.4) nets a 2-gw lookahead delta of
+    5.85 over WeakMid (clears the OLD 1.5 hurdle but not a forced hit's -4, i.e. net margin 1.85 <
+    HIT_TRANSFER_HURDLE_XP) while (xg=1.6, xa=0.9) nets +14.2 (net margin ~10.2, clears it easily)."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    database.init_db(conn)
+
+    for tid in range(1, N_TEAMS + 1):
+        conn.execute(
+            "INSERT INTO teams (id, name, short_name, strength_attack_home, strength_attack_away, "
+            "strength_defence_home, strength_defence_away) VALUES (?, ?, ?, 1100, 1100, 1100, 1100)",
+            (tid, f"Team{tid}", f"T{tid}"),
+        )
+
+    conn.execute(
+        "INSERT INTO gameweeks (id, name, deadline_time, is_current, is_next, finished) "
+        "VALUES (1, 'GW1', '2020-01-01T00:00:00Z', 0, 0, 1)"
+    )
+    for gw in range(2, 4):
+        conn.execute(
+            "INSERT INTO gameweeks (id, name, deadline_time, is_current, is_next, finished) VALUES (?, ?, ?, 0, ?, 0)",
+            (gw, f"GW{gw}", "2099-01-01T00:00:00Z", 1 if gw == 2 else 0),
+        )
+        for team_a, team_b in [(1, 2), (3, 4), (5, 6)]:
+            conn.execute(
+                "INSERT INTO fixtures (event, team_h, team_a, team_h_difficulty, team_a_difficulty, finished) "
+                "VALUES (?, ?, ?, 3, 3, 0)",
+                (gw, team_a, team_b),
+            )
+
+    pid = 1
+    squad_ids = []
+    _insert_player(conn, pid, 1, 1, 40, xg=0.0, xa=0.0, saves=2.0, starts_per_90=1.0); squad_ids.append(pid); pid += 1
+    _insert_player(conn, pid, 2, 1, 40, xg=0.0, xa=0.0, saves=1.0, starts_per_90=0.3); squad_ids.append(pid); pid += 1
+    for i in range(5):
+        _insert_player(conn, pid, (i % N_TEAMS) + 1, 2, 45 + i, xg=0.05, xa=0.08, defcon=6.0, starts_per_90=0.9)
+        squad_ids.append(pid); pid += 1
+    for i in range(4):
+        _insert_player(conn, pid, (i % N_TEAMS) + 1, 3, 55 + i, xg=0.25, xa=0.2, starts_per_90=0.9)
+        squad_ids.append(pid); pid += 1
+    weak_mid_id = pid
+    _insert_player(conn, pid, 6, 3, 50, xg=0.0, xa=0.0, starts_per_90=0.9, web_name="WeakMid")
+    squad_ids.append(pid); pid += 1
+    for i in range(3):
+        _insert_player(conn, pid, ((i + 3) % N_TEAMS) + 1, 4, 60 + i, xg=0.4, xa=0.1, starts_per_90=0.9)
+        squad_ids.append(pid); pid += 1
+    assert len(squad_ids) == 15
+
+    upgrade_id = pid
+    _insert_player(conn, pid, 6, 3, 50, xg=upgrade_xg, xa=upgrade_xa, starts_per_90=0.95, web_name=upgrade_web_name)
+
+    conn.commit()
+    return conn, squad_ids, weak_mid_id, upgrade_id
+
+
+def test_hit_transfer_hurdle_blocks_a_modest_upgrade_that_clears_only_the_old_free_hurdle():
+    conn, squad_ids, weak_mid_id, modest_id = _build_hit_hurdle_db(0.6, 0.4, "ModestUpgrade")
+    # free_transfers=0 forces ANY transfer this single-gw horizon to spend a hit (t=1 > ft_before=0).
+    roadmap = plan_transfers(
+        conn, squad_ids, bank=50, free_transfers=0, horizon_gws=1,
+        allow_hits=True, freeze_gkp_transfers=True,
+    )
+    step = roadmap[0]
+    # Net margin over holding is ~1.85 xP -- comfortably clears the plain 1.5 hurdle, but not
+    # HIT_TRANSFER_HURDLE_XP (4.5) -- must roll (hold) instead of taking the hit.
+    assert step.transfers_made == 0
+    assert step.hit_cost == 0
+    assert modest_id not in step.transfers_in_ids
+    assert weak_mid_id not in step.transfers_out_ids
+
+
+def test_hit_transfer_hurdle_allows_a_big_enough_upgrade_to_take_the_hit():
+    conn, squad_ids, weak_mid_id, big_id = _build_hit_hurdle_db(1.6, 0.9, "BigUpgrade")
+    roadmap = plan_transfers(
+        conn, squad_ids, bank=50, free_transfers=0, horizon_gws=1,
+        allow_hits=True, freeze_gkp_transfers=True,
+    )
+    step = roadmap[0]
+    # Net margin over holding is ~10.2 xP -- clears HIT_TRANSFER_HURDLE_XP (4.5) easily, so the
+    # hit is worth taking.
+    assert step.transfers_made == 1
+    assert step.hit_cost == 4  # sanity: a single hit costs HIT_COST (4)
+    assert big_id in step.transfers_in_ids
+    assert weak_mid_id in step.transfers_out_ids
+
+
+def test_hit_transfer_hurdle_not_applied_when_a_free_transfer_covers_it():
+    """The SAME modest upgrade that gets blocked as a hit (previous test) should still go through
+    when a free transfer is actually available -- hit_transfer_hurdle_xp only gates candidates
+    that spend a hit, never a plain free swap."""
+    conn, squad_ids, weak_mid_id, modest_id = _build_hit_hurdle_db(0.6, 0.4, "ModestUpgrade")
+    roadmap = plan_transfers(
+        conn, squad_ids, bank=50, free_transfers=1, horizon_gws=1,
+        allow_hits=True, freeze_gkp_transfers=True,
+    )
+    step = roadmap[0]
+    assert step.hit_cost == 0
+    assert modest_id in step.transfers_in_ids
+    assert weak_mid_id in step.transfers_out_ids

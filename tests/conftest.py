@@ -29,7 +29,13 @@ TEAM_IDS = list(range(1, 9))  # 8 synthetic teams -- enough spread that MAX_PLAY
 def make_player(id: int, element_type: int, team_id: int, cost: int, xp: float, **overrides) -> PlayerRow:
     """One synthetic PlayerRow with sane defaults for every field _solve_lineup_milp's constraints
     touch -- override just the field(s) a given test cares about (status, chance_of_playing_next_round,
-    xmins, ...)."""
+    xmins, ...).
+
+    starts defaults to 10 (NOT PlayerRow's own dataclass default of 0) specifically so a test
+    doesn't accidentally read as a GW1 Pre-Season Cold-Start pool (optimizer.is_cold_start_pool --
+    True only when EVERY candidate has starts == 0) just because it never bothered setting starts
+    at all -- a test that specifically wants to exercise cold-start behavior should override
+    starts=0 explicitly, making that intent visible at the call site rather than accidental."""
     defaults = dict(
         id=id,
         web_name=f"Player{id}",
@@ -46,6 +52,7 @@ def make_player(id: int, element_type: int, team_id: int, cost: int, xp: float, 
         saves_per_90=0.0,
         defensive_contribution_per_90=0.0,
         starts_per_90=0.8,
+        starts=10,
         status="a",
         fixture_difficulty=3.0,
         has_fixture=True,

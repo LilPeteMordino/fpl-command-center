@@ -29,6 +29,13 @@ VAASTAV_PLAYERS_RAW_CSV_TEMPLATE = VAASTAV_BASE_URL + "/{season}/players_raw.csv
 # total_points. Powers src/replay.py's Historical Gameweek Replay Mode.
 VAASTAV_GW_STATS_CSV_TEMPLATE = VAASTAV_BASE_URL + "/{season}/gws/gw{gw}.csv"
 
+# Full-season fixture list (one row per match) -- verified (2026-08) live against
+# 2023-24/fixtures.csv: columns include event, team_h, team_a, team_h_difficulty,
+# team_a_difficulty, finished, matching the local `fixtures` table's own columns almost exactly.
+# Powers src/backtest.py's walk-forward Season Simulator (per-gameweek fixture difficulty, without
+# needing any live API access at all for a fully historical/finished season).
+VAASTAV_FIXTURES_CSV_TEMPLATE = VAASTAV_BASE_URL + "/{season}/fixtures.csv"
+
 REQUEST_TIMEOUT_SECONDS = 15
 REQUEST_HEADERS = {"User-Agent": "fpl-analytics-engine/1.0"}
 # Pause between successive FPL requests within a single sync run, to stay polite to the API.
