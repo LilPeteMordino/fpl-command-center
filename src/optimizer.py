@@ -119,6 +119,47 @@ EXTERNAL_XP_BLEND_WEIGHT = 0.5
 # them, not to dilute them with a third (our own) opinion they didn't ask to be weighted against.
 DEFAULT_ENSEMBLE_WEIGHTS = {"fpl_review": 0.5, "fpl_form": 0.5}
 
+# --- Built-in ep_next fallback blend (no upload needed) ------------------------------------------
+# FPL's own bootstrap-static already carries `ep_next` -- their official "expected points next
+# round" consensus figure -- for every player, always, with no CSV upload required. The internal
+# model deliberately does NOT lean on it once it has real season data to work with (a fixture-
+# and-position-aware xG/xA breakdown is a richer, more transparent signal than one opaque number),
+# but early in a player's OWN season -- true cold start (0 real starts, see the GW1 Pre-Season
+# Cold-Start Anchor block below) or just a handful of games in -- the internal per-90 rates are
+# either exactly 0.0 or built from a tiny, noisy sample. ep_next is FPL's own best guess at
+# exactly that same moment, informed by signal this model doesn't have (their own team-news/
+# rotation read, last season's role), so blending it in -- weighted down as this player's own
+# `starts` count grows -- tempers early-season noise without ever overriding an increasingly
+# well-evidenced internal projection. Only applied when no uploaded ensemble source already covers
+# this player+gameweek (an explicit human-curated projection always wins outright, unchanged).
+EP_NEXT_BLEND_MAX_WEIGHT = 0.5  # ep_next's blend weight at 0 real starts this season (matches
+# EXTERNAL_XP_BLEND_WEIGHT's own 50/50 split above, for the same "co-equal opinion" reasoning)
+EP_NEXT_BLEND_FADE_OUT_STARTS = 6  # by this many real starts, ep_next's weight has faded to 0.0
+
+
+def ep_next_blend_weight(starts: int) -> float:
+    """Linear fade from EP_NEXT_BLEND_MAX_WEIGHT at starts=0 down to 0.0 at
+    starts>=EP_NEXT_BLEND_FADE_OUT_STARTS -- see the block comment above."""
+    if starts >= EP_NEXT_BLEND_FADE_OUT_STARTS:
+        return 0.0
+    return EP_NEXT_BLEND_MAX_WEIGHT * (1.0 - starts / EP_NEXT_BLEND_FADE_OUT_STARTS)
+
+
+def blend_ep_next_fallback(breakdown: "XPBreakdown", ep_next: Optional[float], starts: int) -> "XPBreakdown":
+    """Blends FPL's own ep_next into breakdown.total at ep_next_blend_weight(starts) -- see the
+    block comment above. Only `total` changes (same convention as blend_external_xp): the
+    attack/defensive/saves/bonus/appearance sub-components stay the internal model's own numbers,
+    since there's no equivalent breakdown for FPL's single ep_next figure to blend into. Returns
+    `breakdown` unchanged when ep_next is unavailable (None) or its weight has already faded to 0."""
+    if ep_next is None:
+        return breakdown
+    weight = ep_next_blend_weight(starts)
+    if weight <= 0.0:
+        return breakdown
+    blended_total = round(weight * ep_next + (1 - weight) * breakdown.total, 3)
+    return replace(breakdown, total=blended_total, external_xp=round(ep_next, 3), blended=True)
+
+
 # --- Lineup security (xMins) -------------------------------------------------------------------
 # Projected starting minutes for the target gameweek, used two ways: (1) every player's xP is
 # scaled by xmins/90 ("Effective xP"), so a rotation-risk player's raw model/ensemble score gets
@@ -393,6 +434,8 @@ class PlayerRow:
     is_home: Optional[bool] = None  # True/False for the target gameweek's fixture (None = unknown/
     # no fixture) -- feeds the Talisman Penalty-Taker captaincy boost's "home fixture" condition
     # (see _is_talisman_boost_favorable); not used anywhere else in the model.
+    expected_goals_conceded_per_90: float = 0.0  # this player's own real xGC rate -- see
+    # _blend_player_xga (0.0 means no real minutes-backed figure yet, same meaning as elsewhere)
 
     @property
     def cost_millions(self) -> float:
@@ -606,6 +649,25 @@ def _team_xga_proxy(fixture_difficulty: float) -> float:
     return XGA_AT_EASIEST_FIXTURE + span * frac
 
 
+PLAYER_XGA_BLEND_WEIGHT = 0.5  # how much a player's own real expected_goals_conceded_per_90
+# blends into the fixture-difficulty-only team proxy, once they actually have any (see
+# _blend_player_xga) -- co-equal with the fixture read, same reasoning as EP_NEXT_BLEND_MAX_WEIGHT.
+
+
+def _blend_player_xga(player_xga_per_90: float, team_xga_proxy: float) -> float:
+    """Blends a player's own real expected_goals_conceded_per_90 (their actual on-pitch defensive
+    exposure this season -- e.g. a low-possession, deep-blocking side's fullback genuinely faces
+    more shots than a dominant side's, regardless of any one match's FDR) with the fixture-
+    difficulty-only team proxy (_team_xga_proxy) -- the player figure is real but doesn't know
+    anything about the SPECIFIC upcoming opponent; the team proxy knows the fixture but not this
+    player's real personal exposure. Falls back to the team proxy alone (identical to the old
+    behavior) when the player has no real minutes-backed xGC yet (0.0 -- a genuine cold start for
+    this specific signal, distinct from the general games_played one)."""
+    if player_xga_per_90 <= 0.0:
+        return team_xga_proxy
+    return PLAYER_XGA_BLEND_WEIGHT * player_xga_per_90 + (1 - PLAYER_XGA_BLEND_WEIGHT) * team_xga_proxy
+
+
 def _poisson_at_least(mu: float, threshold: int) -> float:
     """P(X >= threshold) for X ~ Poisson(mu): converts a per-90 action rate (e.g. defensive
     contributions) into the probability of clearing a fixed count in a single match."""
@@ -618,11 +680,27 @@ def _poisson_at_least(mu: float, threshold: int) -> float:
     return max(0.0, min(1.0, 1.0 - cdf))
 
 
-def _projected_minutes_fraction(starts_per_90: float, status: str) -> float:
-    """Rough probability of a meaningful appearance this gameweek: how often they start,
-    tempered by fitness/rotation risk (the existing status-based minutes multiplier)."""
-    start_rate = max(0.0, min(1.0, starts_per_90 or 0.0))
-    return start_rate * minutes_security_multiplier(status)
+def _projected_minutes_fraction(player, games_played: int) -> float:
+    """Rough probability of a meaningful appearance this gameweek: how often they start (their own
+    starts_per_90 rate, once their team has actually played games this season), tempered by
+    fitness/rotation risk (the existing status-based minutes multiplier).
+
+    Pre-season (games_played == 0, so starts_per_90 is necessarily also 0.0 -- bootstrap-static
+    carries no prior-season history), falls back to the same price/ownership starts-rate proxy
+    calculate_baseline_xmins already uses (_preseason_starts_rate_fallback) instead of leaving this
+    at a hard 0.0. Before this fallback existed here, appearance_xp/attack_xp/defensive_xp/bonus_xp
+    all being scaled by an unconditional 0.0 meant projected_xp came out exactly 0.0 for literally
+    every player before a ball had been kicked -- including established, obviously-starting
+    superstars -- even though calculate_baseline_xmins's OWN parallel "minutes" figure (this
+    player's displayed xmins) already correctly used this same fallback and looked perfectly
+    reasonable. That mismatch made the model's own captaincy/Starting-XI ranking pure noise at
+    exactly the highest-stakes moment of the season (the real GW1 deadline), independent of and in
+    addition to GW1_COLD_START_PRICE_BONUS's own multiplicative-on-zero bug below."""
+    if games_played > 0:
+        start_rate = max(0.0, min(1.0, player.starts_per_90 or 0.0))
+    else:
+        start_rate = _preseason_starts_rate_fallback(player)
+    return start_rate * minutes_security_multiplier(player.status)
 
 
 def _is_defensive_mid(player) -> bool:
@@ -649,7 +727,7 @@ def _fallback_defcon_prob(player, cs_prob: float, is_defensive_mid: bool) -> flo
     return DEFCON_FALLBACK_CENTRAL_DEF if is_central_defender_profile else DEFCON_FALLBACK_ATTACKING
 
 
-def calculate_positional_xp(player, fixture_difficulty: float) -> XPBreakdown:
+def calculate_positional_xp(player, fixture_difficulty: float, games_played: int) -> XPBreakdown:
     """Position-specific projected points: four dedicated formulas (one per real FPL scoring
     archetype), not one generalized formula reused across positions.
 
@@ -690,14 +768,18 @@ def calculate_positional_xp(player, fixture_difficulty: float) -> XPBreakdown:
     APPEARANCE_POINTS_FULL already approximates the real 60-minutes discrete threshold with a
     continuous minutes fraction -- flooring a *mean* would understate the true expectation
     (E[floor(X/k)] != floor(E[X]/k) in general) rather than more faithfully model the real rule.
+
+    games_played is the player's TEAM's finished-fixture count this season (see
+    team_games_played) -- 0 pre-season, engaging _projected_minutes_fraction's price/ownership
+    starts-rate fallback for every component below instead of hard-zeroing them all.
     """
-    minutes_fraction = _projected_minutes_fraction(player.starts_per_90, player.status)
+    minutes_fraction = _projected_minutes_fraction(player, games_played)
     appearance_xp = minutes_fraction * APPEARANCE_POINTS_FULL
     is_def_mid = _is_defensive_mid(player)  # only used pre-season, to pick MID's DEFCON fallback baseline
 
     if player.element_type == 1:  # GKP
         cs_prob = _team_cs_probability(fixture_difficulty)
-        xga = _team_xga_proxy(fixture_difficulty)
+        xga = _blend_player_xga(player.expected_goals_conceded_per_90, _team_xga_proxy(fixture_difficulty))
         defcon_prob = 0.0
         attack_xp = 0.0  # deliberately always 0.0 -- GKPs are never scored/ranked on outfield xGI
         saves_xp = player.saves_per_90 * SAVE_POINTS_PER_SAVE
@@ -708,7 +790,7 @@ def calculate_positional_xp(player, fixture_difficulty: float) -> XPBreakdown:
 
     elif player.element_type == 2:  # DEF
         cs_prob = _team_cs_probability(fixture_difficulty)
-        xga = _team_xga_proxy(fixture_difficulty)
+        xga = _blend_player_xga(player.expected_goals_conceded_per_90, _team_xga_proxy(fixture_difficulty))
         if player.defensive_contribution_per_90 > 0.0:
             defcon_prob = _poisson_at_least(player.defensive_contribution_per_90, DEFCON_THRESHOLD)
         else:
@@ -812,6 +894,74 @@ def blend_external_xp(
     return replace(breakdown, total=blended_total, external_xp=round(external_xp, 3), blended=True)
 
 
+# --- Recent-form rolling window & prior-season cold-start rate ------------------------------
+# Both read from the optional player_gw_history/player_season_history tables (see
+# fpl_api.sync_player_history -- a separate, opt-in sync step, since it's one HTTP request per
+# player with no bulk equivalent). Both tables being empty (sync never run) is the default,
+# always-safe state: every function below degrades to returning nothing, leaving fetch_players'
+# existing flat cumulative-season xg_per_90/xa_per_90 exactly as it always was.
+
+RECENT_FORM_WINDOW_GAMES = 5  # rolling window size for recent_form_rate
+RECENT_FORM_MIN_GAMES = 3  # fewer real-minutes games than this in the window is itself too thin
+# a sample to trust over the flat season-long cumulative rate -- falls back to that instead.
+
+
+def recent_form_rate(gw_rows: list, window: int = RECENT_FORM_WINDOW_GAMES) -> Optional[tuple]:
+    """From a player's this-season per-gameweek rows (each a dict with 'minutes',
+    'expected_goals', 'expected_assists', in ascending round order), computes (xg_per_90,
+    xa_per_90) over just the last `window` games with real minutes -- a recency-weighted
+    alternative to the flat season-long cumulative average, which dilutes a genuine recent role
+    change (a new penalty taker, a formation switch, returning sharper after injury) by however
+    many earlier games don't reflect it. Returns None when fewer than RECENT_FORM_MIN_GAMES real
+    games exist in that window, so callers know to keep the flat season-long rate instead."""
+    real_games = [r for r in gw_rows if (r.get("minutes") or 0) > 0][-window:]
+    if len(real_games) < RECENT_FORM_MIN_GAMES:
+        return None
+    total_minutes = sum(r["minutes"] for r in real_games)
+    if total_minutes <= 0:
+        return None
+    total_xg = sum(r.get("expected_goals") or 0.0 for r in real_games)
+    total_xa = sum(r.get("expected_assists") or 0.0 for r in real_games)
+    return round(total_xg / total_minutes * 90, 4), round(total_xa / total_minutes * 90, 4)
+
+
+def recent_form_by_player_lookup(conn) -> dict:
+    """player_id -> (xg_per_90, xa_per_90) rolling-window rate (see recent_form_rate), for every
+    player with enough recent real-minutes games in player_gw_history -- {} (empty) when that
+    table hasn't been populated yet (sync_player_history never run)."""
+    rows = conn.execute(
+        "SELECT player_id, round, minutes, expected_goals, expected_assists "
+        "FROM player_gw_history ORDER BY player_id, round"
+    ).fetchall()
+    by_player: dict = {}
+    for row in rows:
+        by_player.setdefault(row["player_id"], []).append(dict(row))
+    result = {}
+    for player_id, gw_rows in by_player.items():
+        rate = recent_form_rate(gw_rows)
+        if rate is not None:
+            result[player_id] = rate
+    return result
+
+
+def last_season_rate_by_player_lookup(conn) -> dict:
+    """player_id -> (xg_per_90, xa_per_90) from player_season_history's stored prior season -- a
+    genuine, personal cold-start prior for calculate_positional_xp's games_played==0 branch,
+    instead of the flat 0.0 that branch would otherwise see. {} (empty) when that table hasn't
+    been populated yet (sync_player_history never run)."""
+    rows = conn.execute("SELECT player_id, minutes, expected_goals, expected_assists FROM player_season_history").fetchall()
+    result = {}
+    for row in rows:
+        minutes = row["minutes"] or 0
+        if minutes <= 0:
+            continue
+        result[row["player_id"]] = (
+            round((row["expected_goals"] or 0.0) / minutes * 90, 4),
+            round((row["expected_assists"] or 0.0) / minutes * 90, 4),
+        )
+    return result
+
+
 def fetch_players(conn, ensemble_weights: Optional[dict] = None) -> list:
     """Load all selectable players with team info and a positional xP projection for the target
     gameweek (see calculate_positional_xp). For any player covered by an uploaded external CSV
@@ -833,13 +983,16 @@ def fetch_players(conn, ensemble_weights: Optional[dict] = None) -> list:
     xmins_ensemble_by_player = _xmins_ensemble_lookup(conn, event_id, ensemble_weights)
     games_played_by_team = team_games_played(conn)
     preseason_by_player = database.get_preseason_adjustments(conn)
+    recent_form_by_player = recent_form_by_player_lookup(conn)
+    last_season_rate_by_player = last_season_rate_by_player_lookup(conn)
 
     rows = conn.execute(
         """
         SELECT p.id, p.web_name, p.team_id, t.name AS team_name, p.element_type, p.now_cost,
                p.selected_by_percent, p.form, p.total_points, p.ep_next, p.status, p.news,
                p.xg_per_90, p.xa_per_90, p.saves_per_90, p.defensive_contribution_per_90, p.starts_per_90,
-               p.starts, p.chance_of_playing_next_round, p.penalties_order, p.corners_order
+               p.starts, p.chance_of_playing_next_round, p.penalties_order, p.corners_order,
+               p.expected_goals_conceded_per_90
         FROM players p
         JOIN teams t ON t.id = p.team_id
         WHERE p.status != 'u'
@@ -853,6 +1006,21 @@ def fetch_players(conn, ensemble_weights: Optional[dict] = None) -> list:
         avg_difficulty = (
             sum(team_difficulties) / len(team_difficulties) if has_fixture else NEUTRAL_FIXTURE_DIFFICULTY
         )
+
+        # Recent-form rolling window / prior-season cold-start prior -- both optional (empty
+        # dicts, i.e. today's behavior, whenever sync_player_history hasn't been run): a true
+        # cold start (this player's TEAM hasn't played yet) prefers their own real last-season
+        # rate over the flat 0.0 the cumulative-season columns would otherwise carry; once real
+        # in-season games exist, a recent-games rolling window (if there's enough of a sample)
+        # takes over from the flat season-long cumulative average instead -- see
+        # recent_form_rate/last_season_rate_by_player_lookup's own docstrings for why either wins out.
+        team_games = games_played_by_team.get(row["team_id"], 0)
+        xg_per_90, xa_per_90 = row["xg_per_90"] or 0.0, row["xa_per_90"] or 0.0
+        if team_games == 0 and row["id"] in last_season_rate_by_player:
+            xg_per_90, xa_per_90 = last_season_rate_by_player[row["id"]]
+        elif row["id"] in recent_form_by_player:
+            xg_per_90, xa_per_90 = recent_form_by_player[row["id"]]
+
         player = PlayerRow(
             id=row["id"],
             web_name=row["web_name"],
@@ -864,8 +1032,8 @@ def fetch_players(conn, ensemble_weights: Optional[dict] = None) -> list:
             form=row["form"] or 0.0,
             total_points=row["total_points"] or 0,
             ep_next=row["ep_next"],
-            xg_per_90=row["xg_per_90"] or 0.0,
-            xa_per_90=row["xa_per_90"] or 0.0,
+            xg_per_90=xg_per_90,
+            xa_per_90=xa_per_90,
             saves_per_90=row["saves_per_90"] or 0.0,
             defensive_contribution_per_90=row["defensive_contribution_per_90"] or 0.0,
             starts_per_90=row["starts_per_90"] or 0.0,
@@ -878,12 +1046,18 @@ def fetch_players(conn, ensemble_weights: Optional[dict] = None) -> list:
             news=row["news"] or "",
             penalties_order=row["penalties_order"],
             corners_order=row["corners_order"],
+            expected_goals_conceded_per_90=row["expected_goals_conceded_per_90"] or 0.0,
             is_home=home_by_team.get(row["team_id"]),
         )
-        breakdown = calculate_positional_xp(player, avg_difficulty if has_fixture else NEUTRAL_FIXTURE_DIFFICULTY)
+        breakdown = calculate_positional_xp(
+            player, avg_difficulty if has_fixture else NEUTRAL_FIXTURE_DIFFICULTY,
+            games_played_by_team.get(player.team_id, 0),
+        )
         ensemble_xp = ensemble_xp_by_player.get(player.id)
         if ensemble_xp is not None:
             breakdown = replace(breakdown, total=ensemble_xp, external_xp=ensemble_xp, blended=True)
+        else:
+            breakdown = blend_ep_next_fallback(breakdown, player.ep_next, player.starts)
 
         adjustment = preseason_by_player.get(player.id)
         player, breakdown = apply_preseason_adjustment(player, breakdown, adjustment)
@@ -1353,6 +1527,61 @@ def solve_starting_xi(
         formation_lock=formation_lock,
     )
     return result["starting_xi"], result["bench"], result["formation"]
+
+
+# Every STARTER_SECURITY_PROFILES tier, strictest first, plus a final "no floor" resort -- see
+# solve_starting_xi_with_fallback. src/backtest.py has its own equivalent chain (anchored at
+# DEFAULT_STARTER_XMINS_FLOOR, since a 38-gameweek unattended run has no user to ask); this one is
+# anchored at whatever floor the CALLER actually requested, since here there IS a human on the
+# other end who chose a specific Starter Security profile on purpose.
+_FULL_STARTER_FLOOR_CHAIN = (
+    STARTER_SECURITY_PROFILES["conservative"], STARTER_SECURITY_PROFILES["balanced"],
+    STARTER_SECURITY_PROFILES["aggressive"], None,
+)
+
+
+def solve_starting_xi_with_fallback(
+    squad: list, min_starter_xmins: Optional[float] = None, risk_lambda: float = 0.0,
+    formation_lock: Optional[str] = None,
+):
+    """solve_starting_xi, but degrades the minutes-security floor automatically instead of
+    raising OptimizationError outright when the requested one makes the squad's XI infeasible --
+    real case this fixes: several squad members genuinely below 60 xMins at once (thin/no recent
+    minutes) can leave fewer than 11 players clearing even the "Balanced" floor, which used to
+    just dead-end the whole page with a bare error and no way forward short of the user manually
+    finding the sidebar's Starter Security control themselves.
+
+    Tries min_starter_xmins first, then each STARTER_SECURITY_PROFILES tier strictly BELOW it (so
+    a caller who already asked for "Aggressive" doesn't retry stricter floors that would only
+    fail the same way), then finally no floor at all -- the same last-resort backtest.py's own
+    fallback chain uses. formation_lock is intentionally NOT relaxed by this fallback (only the
+    minutes floor is) -- an explicit formation choice should fail loudly, not silently change shape.
+
+    Returns (starting_xi, ordered_bench, formation_label, floor_used, was_relaxed) -- floor_used
+    is whichever floor actually worked (None if no floor was needed at all), and was_relaxed is
+    True whenever that isn't the same floor the caller originally asked for, so callers can show a
+    "had to relax your Starter Security setting" notice rather than silently ignoring it. Raises
+    OptimizationError (same as solve_starting_xi) only if even no floor at all is infeasible --
+    a genuine squad-construction problem (e.g. a formation_lock no legal 11 can satisfy), not a
+    minutes-security one.
+    """
+    if min_starter_xmins is None:
+        chain = [None]  # already the most permissive floor -- nothing stricter would help, nothing looser exists
+    else:
+        chain = [min_starter_xmins] + [
+            floor for floor in _FULL_STARTER_FLOOR_CHAIN if floor is None or floor < min_starter_xmins
+        ]
+    last_error: Optional[OptimizationError] = None
+    for floor in chain:
+        try:
+            starting_xi, bench, formation = solve_starting_xi(
+                squad, min_starter_xmins=floor, risk_lambda=risk_lambda, formation_lock=formation_lock,
+            )
+            return starting_xi, bench, formation, floor, floor != min_starter_xmins
+        except OptimizationError as exc:
+            last_error = exc
+            continue
+    raise last_error or OptimizationError("Starting XI solver infeasible even with no minutes-security floor at all.")
 
 
 def calculate_team_xp(starting_xi: list, captain: PlayerRow) -> float:

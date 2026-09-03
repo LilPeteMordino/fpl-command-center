@@ -103,6 +103,28 @@ def _current_or_next_event_id(conn):
     return row["id"] if row else None
 
 
+def _picks_event_id(conn):
+    """The gameweek to fetch a manager's live PICKS for -- distinct from
+    _current_or_next_event_id, which prefers the *upcoming* gameweek (is_next) for projection
+    purposes. Picks only exist once a deadline has actually passed, and FPL's own bootstrap-static
+    can leave is_current stuck False (with is_next already advanced to the following gameweek) for
+    HOURS after a deadline genuinely passes -- most visibly right after the GW1 deadline, when
+    asking for is_next's event would fetch an always-404 future gameweek's picks and misreport a
+    live, already-picked-for season as "pre-season still".
+
+    Resolves instead from the raw deadline_time column: the highest-id unfinished gameweek whose
+    deadline has already passed (see fpl_api.deadline_has_passed) is the one whose picks should be
+    live. Falls back to _current_or_next_event_id's flag-based logic when no gameweek's deadline
+    has passed yet (genuine pre-season, before GW1) or deadline_time data isn't available."""
+    rows = conn.execute(
+        "SELECT id, deadline_time FROM gameweeks WHERE finished = 0 ORDER BY id"
+    ).fetchall()
+    passed_ids = [r["id"] for r in rows if fpl_api.deadline_has_passed(r["deadline_time"])]
+    if passed_ids:
+        return max(passed_ids)
+    return _current_or_next_event_id(conn)
+
+
 def _current_live_event_id(conn):
     """The gameweek currently IN PROGRESS (is_current=1), or None if no gameweek is live right
     now (pre-deadline, or between gameweeks) -- distinct from _current_or_next_event_id, which
@@ -187,6 +209,22 @@ def _min_starter_xmins() -> float:
     (see render_sidebar) -- falls back to Balanced before the radio has been rendered/touched."""
     label = st.session_state.get("starter_security_label", STARTER_SECURITY_DEFAULT_LABEL)
     return STARTER_SECURITY_OPTIONS.get(label, optimizer.DEFAULT_STARTER_XMINS_FLOOR)
+
+
+def _starter_floor_relaxed_message(floor_used: Optional[float]) -> str:
+    """Shown whenever optimizer.solve_starting_xi_with_fallback had to relax below the sidebar's
+    own Starter Security setting to find a legal XI at all -- real case this covers: several
+    squad members genuinely below the requested floor at once (thin/no recent minutes), which
+    used to just dead-end the whole page with a bare 'Infeasible' error and no way forward short
+    of a user manually finding the sidebar control themselves."""
+    floor_desc = f"{floor_used:.0f} xMins" if floor_used is not None else "no minutes floor at all"
+    return (
+        f"Your Starter Security setting couldn't build a legal Starting XI from this squad -- too "
+        f"many players are currently below that floor at once. Automatically relaxed to **{floor_desc}** "
+        f"for this view. Consider a looser Starter Security profile in the sidebar, or address the "
+        f"underlying minutes risk with a transfer -- the players below your floor are exactly who a "
+        f"transfer suggestion would flag."
+    )
 
 
 def _risk_lambda() -> float:
@@ -384,6 +422,24 @@ def _render_preseason_scouting_expander(conn) -> None:
 
 # --- Top header bar: Automated FPL Team ID Sync ---------------------------------
 
+def _sync_squad_with_gw1_fallback(client: FPLClient, team_id: int, event_id: int) -> dict:
+    """fpl_api.fetch_squad_state, with one extra safety net for the specific way GW1 squad sync
+    can get wrongly blocked: event_id (from _picks_event_id) is already deadline-aware, but if its
+    own inputs are stale or missing (gameweeks table not freshly synced, deadline_time absent) it
+    can still land on a gameweek whose picks aren't actually live yet. Rather than trust that and
+    show a misleading "pre-season" message, a 404 on any event other than 1 is followed by one
+    direct live probe of event=1's picks -- if THAT returns 200, the season/GW1 is genuinely
+    active regardless of what event_id or FPL's own is_current flag said, and that data is used
+    instead. Only re-raises the original 404 if the event-1 probe also fails."""
+    try:
+        return fpl_api.fetch_squad_state(client, team_id, event_id)
+    except FPLAPIError as exc:
+        if exc.status_code != 404 or event_id == 1:
+            raise
+        return fpl_api.fetch_squad_state(client, team_id, 1)
+
+
+
 def _apply_synced_team(team: dict, team_id_input: str) -> None:
     """Persists a fpl_api.fetch_squad_state() result into session_state -- shared by every sync
     entry point (top header, sidebar) so a full sync always hydrates the same fields.
@@ -442,14 +498,14 @@ def _render_team_id_header(conn) -> None:
             st.error("FPL Team ID must be a number.")
             return
 
-        event_id = _current_or_next_event_id(conn)
+        event_id = _picks_event_id(conn)
         if event_id is None:
             st.error("No gameweeks found locally -- sync live data first.")
             return
 
         client = FPLClient()
         try:
-            team = fpl_api.fetch_squad_state(client, team_id, event_id)
+            team = _sync_squad_with_gw1_fallback(client, team_id, event_id)
         except FPLAPIError as exc:
             if exc.status_code == 404:
                 st.info("Pre-season active: GW1 picks are private until deadline. Use Squad Optimizer to build a draft squad.")
@@ -504,6 +560,39 @@ def render_sidebar(conn) -> str:
                         )
                     except Exception as exc:
                         st.warning(f"Could not restore your saved draft after the sync: {exc}")
+
+        with st.expander("\U0001F553 Sync Player History (slower, optional)"):
+            st.caption(
+                "Fetches each player's per-gameweek breakdown for this season and their prior "
+                "season's totals -- one request per player, so this can take a few minutes for "
+                "the full pool, unlike the fast bulk sync above. Powers two things: a recent-form "
+                "rolling window (reacts faster to a genuine role change than the flat "
+                "season-to-date average) once there are enough real games banked, and a real "
+                "prior-season prior for a true cold-start player instead of guessing off price/"
+                "ownership alone. Safe to skip -- everything works without this, just with a "
+                "slightly noisier early read."
+            )
+            if st.button("\U0001F553 Sync Player History", use_container_width=True):
+                player_ids = [r["id"] for r in conn.execute("SELECT id FROM players WHERE status != 'u'").fetchall()]
+                if not player_ids:
+                    st.warning("No players cached locally yet -- run 'Sync Live FPL Data' first.")
+                else:
+                    progress = st.progress(0.0, text=f"0 / {len(player_ids)} players")
+
+                    def _on_progress(done: int, total: int, _name: str) -> None:
+                        progress.progress(done / total, text=f"{done} / {total} players")
+
+                    client = FPLClient()
+                    result = fpl_api.sync_player_history(conn, client, player_ids, progress_callback=_on_progress)
+                    progress.empty()
+                    st.cache_data.clear()
+                    if result["failed"]:
+                        st.warning(
+                            f"Synced history for {result['synced']} players; {len(result['failed'])} "
+                            f"couldn't be fetched (no history yet, or a request failed) and were skipped."
+                        )
+                    else:
+                        st.success(f"Synced history for {result['synced']} players.")
 
         st.divider()
         with st.expander("📄 Projections & Data Source (optional)"):
@@ -664,7 +753,7 @@ def render_sidebar(conn) -> str:
         if st.button("Sync My Squad", use_container_width=True) and manager_id_input:
             try:
                 manager_id = int(manager_id_input)
-                event_id = _current_or_next_event_id(conn)
+                event_id = _picks_event_id(conn)
                 if event_id is None:
                     st.error("No gameweeks found locally -- sync live data first.")
                 else:
@@ -673,7 +762,7 @@ def render_sidebar(conn) -> str:
                         # Same full Automated Team ID Sync as the top header (squad, bank, rank,
                         # identity, joined leagues, chips, estimated banked FTs) -- see
                         # _apply_synced_team.
-                        team = fpl_api.fetch_squad_state(client, manager_id, event_id)
+                        team = _sync_squad_with_gw1_fallback(client, manager_id, event_id)
                     except FPLAPIError as exc:
                         if exc.status_code == 404:
                             st.info(
@@ -1000,8 +1089,8 @@ def _transfer_card_html(suggestions: list) -> str:
 def _price_alert_pill_html(alerts: list) -> str:
     """One pill per at-risk squad asset (see fpl_api.compute_price_change_alerts) -- rise
     likelihood in green ('lock in team value'), drop risk in red ('execute the transfer before
-    the ~1:30am UK price-change window'). A heuristic proxy off today's transfer momentum, not a
-    guaranteed predictor -- see compute_price_change_alerts' own docstring."""
+    the ~1:30am UK price-change window'). Not a guaranteed predictor even with FPL's own
+    price_change_percent factored in -- see compute_price_change_alerts' own docstring."""
     if not alerts:
         return ""
     pills = []
@@ -1179,11 +1268,19 @@ def render_command_center_tab(conn):
     strategy_mode = STRATEGY_MODE_OPTIONS.get(strategy_label, "balanced")
 
     try:
-        starting_xi, bench, formation = optimizer.solve_starting_xi(squad_rows, min_starter_xmins=_min_starter_xmins(), risk_lambda=_risk_lambda(), formation_lock=_formation_lock())
-        captain_info = optimizer.get_captain_recommendations(conn, [p.id for p in squad_rows], ensemble_weights=_ensemble_weights(), min_starter_xmins=_min_starter_xmins(), risk_lambda=_risk_lambda(), formation_lock=_formation_lock())
+        starting_xi, bench, formation, floor_used, was_relaxed = optimizer.solve_starting_xi_with_fallback(
+            squad_rows, min_starter_xmins=_min_starter_xmins(), risk_lambda=_risk_lambda(), formation_lock=_formation_lock(),
+        )
+        captain_info = optimizer.get_captain_recommendations(
+            conn, [p.id for p in squad_rows], ensemble_weights=_ensemble_weights(),
+            min_starter_xmins=floor_used, risk_lambda=_risk_lambda(), formation_lock=_formation_lock(),
+        )
     except OptimizationError as exc:
         st.error(str(exc))
         return
+
+    if was_relaxed:
+        st.warning(_starter_floor_relaxed_message(floor_used))
 
     _render_points_projection_panel(conn, squad_ids, starting_xi, captain_info["captain"]["player"], strategy_mode)
 
@@ -1198,7 +1295,7 @@ def render_command_center_tab(conn):
             conn, mode=strategy_mode, ensemble_weights=_ensemble_weights(),
             locked_ids=_squad_locks(), excluded_ids=_squad_blacklist(), risk_lambda=_risk_lambda(),
         )
-        optimal_xi, _optimal_bench, _optimal_formation = optimizer.solve_starting_xi(
+        optimal_xi, _optimal_bench, _optimal_formation, _floor, _relaxed = optimizer.solve_starting_xi_with_fallback(
             optimal_squad, min_starter_xmins=_min_starter_xmins(), risk_lambda=_risk_lambda(), formation_lock=_formation_lock(),
         )
         optimal_xi_xp = sum(p.projected_xp for p in optimal_xi)
@@ -1233,6 +1330,10 @@ def render_command_center_tab(conn):
                 transfer_suggestions = _suggest_transfers_next_gw(
                     conn, squad_ids, bank_for_suggestions, horizon_gws=3, top_n=2
                 )
+                _annotate_would_start_after_swap(
+                    all_players, squad_rows, transfer_suggestions,
+                    _min_starter_xmins(), _risk_lambda(), _formation_lock(),
+                )
         except OptimizationError as exc:
             st.error(str(exc))
             transfer_suggestions = []
@@ -1245,7 +1346,12 @@ def render_command_center_tab(conn):
         vice_captain = captain_info.get("vice_captain")
         vice_id = vice_captain["player"].id if vice_captain else None
         opponent_map = _team_opponent_labels(conn, event_id)
-        render_pitch_view(conn, starting_xi, bench, captain_id, vice_id, opponent_map, metric="xp")
+        # Suggested Transfers-Out Highlight: transfer_suggestions is keyed by outgoing player id
+        # so render_pitch_view can mark the exact starting-XI (or bench) card(s) it names --
+        # "the optimal 11 you have right now, with the tool's own suggested changes highlighted
+        # on it" rather than the suggestions living only in the separate text sheet below.
+        transfer_out_map = {s["out"].id: s for s in transfer_suggestions}
+        render_pitch_view(conn, starting_xi, bench, captain_id, vice_id, opponent_map, metric="xp", transfer_out_map=transfer_out_map)
 
         transfers_summary = "; ".join(
             f"OUT {s['out'].web_name} → IN {s['in'].web_name} (+{s['xp_gain']:.1f} xP)" for s in transfer_suggestions
@@ -1292,6 +1398,61 @@ def render_command_center_tab(conn):
             for i, p in enumerate(bench, start=1):
                 st.caption(f"Sub {i}: {p.web_name} ({p.position})")
 
+    if transfer_suggestions:
+        st.divider()
+        st.subheader("\U0001F52E Projected Starting XI After Suggested Transfers")
+        st.caption(
+            "Your Starting XI if you actually made every suggestion above -- rebuilt from scratch "
+            "as one 15-man squad, not swap-by-swap, since a suggested-out player who's currently "
+            "benched doesn't free a STARTING slot on their own. New signings are marked green; "
+            "whoever they actually displace from today's XI is named below, which isn't always "
+            "the specific player being sold."
+        )
+        post_squad = _post_transfer_squad(all_players, squad_rows, transfer_suggestions)
+        if len(post_squad) != len(squad_rows):
+            st.warning("Couldn't resolve every suggested player in the current pool -- projected XI unavailable.")
+        else:
+            try:
+                new_xi, new_bench, new_formation, new_floor_used, new_was_relaxed = optimizer.solve_starting_xi_with_fallback(
+                    post_squad, min_starter_xmins=_min_starter_xmins(), risk_lambda=_risk_lambda(),
+                    formation_lock=_formation_lock(),
+                )
+                new_captain_info = optimizer.get_captain_recommendations(
+                    conn, [p.id for p in post_squad], ensemble_weights=_ensemble_weights(),
+                    min_starter_xmins=new_floor_used, risk_lambda=_risk_lambda(),
+                    formation_lock=_formation_lock(),
+                )
+            except OptimizationError as exc:
+                st.error(f"Couldn't build the projected XI: {exc}")
+            else:
+                if new_was_relaxed:
+                    st.warning(_starter_floor_relaxed_message(new_floor_used))
+                old_xi_ids = {p.id for p in starting_xi}
+                new_xi_ids = {p.id for p in new_xi}
+                dropped_from_xi = [p.web_name for p in starting_xi if p.id not in new_xi_ids]
+                entered_xi = [p.web_name for p in new_xi if p.id not in old_xi_ids]
+                if dropped_from_xi or entered_xi:
+                    st.info(
+                        f"**Changes to your Starting XI:** OUT of the 11 -- "
+                        f"{', '.join(dropped_from_xi) or 'no one'}. IN to the 11 -- "
+                        f"{', '.join(entered_xi) or 'no one'}."
+                    )
+                else:
+                    st.caption("Making these transfers wouldn't actually change your Starting XI's line-up.")
+
+                new_captain = new_captain_info["captain"]["player"]
+                new_vice_info = new_captain_info.get("vice_captain")
+                if new_captain.id != captain_id:
+                    st.caption(f"Captain would also change to **{new_captain.web_name}**.")
+
+                st.markdown(f"**Formation: {new_formation}**")
+                new_signing_ids = {s["in"].id for s in transfer_suggestions}
+                render_pitch_view(
+                    conn, new_xi, new_bench, new_captain.id,
+                    new_vice_info["player"].id if new_vice_info else None,
+                    opponent_map, metric="xp", new_player_ids=new_signing_ids, key_prefix="proj_",
+                )
+
     st.divider()
     st.subheader("5-GW Fixture Ticker")
     ticker_event_ids = transfer_planner.get_horizon_event_ids(conn, 5)
@@ -1318,13 +1479,39 @@ STATUS_LABELS = {
 }
 
 
+def _transfer_suggestion_note_html(transfer_suggestion: dict) -> str:
+    """Shared footer note for a Suggested Transfer-Out card (see _player_card_html/
+    _bench_card_html): names the incoming replacement, the projected gain, and -- when
+    _annotate_would_start_after_swap has resolved it -- whether that incoming player would
+    actually make the rebuilt Starting XI (in_would_start) or just take over this same bench
+    slot (in_would_start is False) rather than leaving that ambiguous, which is exactly what
+    made a real "shouldn't the incoming player be a starter?" question hard to answer at a
+    glance from the pitch view alone."""
+    in_name = html.escape(transfer_suggestion["in"].web_name)
+    xp_gain = transfer_suggestion["xp_gain"]
+    would_start = transfer_suggestion.get("in_would_start")
+    if would_start is True:
+        start_note = ' <span class="in-would-start">&middot; would START</span>'
+    elif would_start is False:
+        start_note = ' <span class="in-would-bench">&middot; would stay benched</span>'
+    else:
+        start_note = ""
+    return (
+        f'<div class="transfer-suggestion-note">&#8644; <span class="in-name">{in_name}</span> '
+        f"(+{xp_gain:.1f} xP){start_note}</div>"
+    )
+
+
 def _player_metric_label(p, metric: str) -> str:
     if metric == "ownership":
         return f"Own {p.selected_by_percent:.1f}%"
     return f"xP {p.projected_xp:.1f}"
 
 
-def _player_card_html(p, is_captain: bool, is_vice: bool, opponent_map: dict, metric: str) -> str:
+def _player_card_html(
+    p, is_captain: bool, is_vice: bool, opponent_map: dict, metric: str, transfer_suggestion: Optional[dict] = None,
+    is_new_signing: bool = False,
+) -> str:
     # Dedicated Captaincy Callout: the badge alone (existing gold/silver C/V) marks WHO has the
     # armband, but doesn't say what it's worth -- this adds the actual doubled points share for
     # the captain, and a "steps in as captain" note for the vice, directly on the pitch card.
@@ -1345,10 +1532,27 @@ def _player_card_html(p, is_captain: bool, is_vice: bool, opponent_map: dict, me
     else:
         badge_html = ""
 
+    # Suggested Transfer-Out Highlight: transfer_suggestion (see render_command_center_tab's
+    # transfer_out_map, built from _suggest_transfers_next_gw) marks a starter the tool thinks is
+    # worth transferring out this gameweek -- a dashed red border/badge on the card itself (same
+    # class carries into the click-through Player Analysis dialog's context, none needed there
+    # since the card is self-explanatory) plus a small footer line naming the suggested incoming
+    # replacement and the projected gain, so the "who" and "who for" are both visible without
+    # leaving the pitch view for the separate 1-Click Deadline Sheet text.
+    card_class = "player-card"
+    suggestion_note = ""
+    if transfer_suggestion is not None:
+        card_class += " transfer-out-suggested"
+        badge_html += '<div class="transfer-out-badge" title="Suggested transfer-out this gameweek">&#8644;</div>'
+        suggestion_note = _transfer_suggestion_note_html(transfer_suggestion)
+    if is_new_signing:
+        card_class += " new-signing"
+        badge_html += '<div class="new-signing-badge" title="New signing from the suggested transfers">NEW</div>'
+
     opponent = opponent_map.get(p.team_id, "BGW")
     pill_bg, pill_text = _difficulty_color(p.fixture_difficulty if p.has_fixture else None)
 
-    return f"""<div class="player-card">
+    return f"""<div class="{card_class}">
 {badge_html}
 <span class="player-pos-tag">{html.escape(p.position)}</span>
 <div class="player-name" title="{html.escape(p.web_name)}">{html.escape(p.web_name)}</div>
@@ -1359,6 +1563,7 @@ def _player_card_html(p, is_captain: bool, is_vice: bool, opponent_map: dict, me
 <span class="stat-badge xp-badge">{html.escape(_player_metric_label(p, metric))}</span>
 </div>
 {captaincy_row}
+{suggestion_note}
 </div>"""
 
 
@@ -1431,9 +1636,14 @@ def _format_deadline_sheet_text(
     return "\n".join(lines)
 
 
-def _bench_card_html(p, slot_label: str, metric: str, opponent_map: dict, highlight_highest_xp: bool = False) -> str:
+def _bench_card_html(
+    p, slot_label: str, metric: str, opponent_map: dict, highlight_highest_xp: bool = False,
+    transfer_suggestion: Optional[dict] = None, is_new_signing: bool = False,
+) -> str:
     """highlight_highest_xp marks Sub 1 -- the Two-Stage Bench Allocation's Step 2 always assigns
-    it to the outfield bench player with the single highest projected_xp (see optimizer.order_bench)."""
+    it to the outfield bench player with the single highest projected_xp (see optimizer.order_bench).
+    transfer_suggestion mirrors _player_card_html's own -- a bench enabler can be a suggested
+    transfer-out too, not just a starter. is_new_signing mirrors its own "NEW" highlight too."""
     opponent = opponent_map.get(p.team_id, "BGW")
     pill_bg, pill_text = _difficulty_color(p.fixture_difficulty if p.has_fixture else None)
     slot_tag_html = html.escape(slot_label)
@@ -1441,12 +1651,25 @@ def _bench_card_html(p, slot_label: str, metric: str, opponent_map: dict, highli
     if highlight_highest_xp:
         slot_tag_html += ' <span class="bench-slot-hint">(Highest xP)</span>'
         slot_title = f"{slot_label} (Highest xP)"
-    return f"""<div class="bench-card">
+
+    card_class = "bench-card"
+    suggestion_note = ""
+    new_badge = ""
+    if transfer_suggestion is not None:
+        card_class += " transfer-out-suggested"
+        suggestion_note = _transfer_suggestion_note_html(transfer_suggestion)
+    if is_new_signing:
+        card_class += " new-signing"
+        new_badge = '<div class="new-signing-badge" title="New signing from the suggested transfers">NEW</div>'
+
+    return f"""<div class="{card_class}">
+{new_badge}
 <span class="bench-slot-tag" title="{html.escape(slot_title)}">{slot_tag_html}</span>
 <div class="player-name" title="{html.escape(p.web_name)}">{html.escape(p.web_name)}</div>
 <div class="player-club">{html.escape(p.position)} · £{p.cost_millions:.1f}m</div>
 <span class="fixture-pill" style="background:{pill_bg};color:{pill_text};">{html.escape(opponent)}</span>
 <div><span class="stat-badge xp-badge">{html.escape(_player_metric_label(p, metric))}</span></div>
+{suggestion_note}
 </div>"""
 
 
@@ -1515,20 +1738,36 @@ def _render_clickable_card(conn, card_html: str, p, opponent_map: dict, key_pref
             _player_detail_dialog(conn, p, opponent_map)
 
 
-def render_pitch_view(conn, starting_xi, bench, captain_id=None, vice_id=None, opponent_map=None, metric: str = "xp"):
+def render_pitch_view(
+    conn, starting_xi, bench, captain_id=None, vice_id=None, opponent_map=None, metric: str = "xp",
+    transfer_out_map: Optional[dict] = None, new_player_ids: Optional[set] = None, key_prefix: str = "",
+):
     """Reusable pitch + bench display: a turf-gradient formation layout (FWD/MID/DEF/GKP rows,
     top to bottom -- standard broadcast/tactical orientation, attacking end up) of floating,
     clickable player cards with glowing gold (C) / silver (V) captain badges, FDR-colored
     fixture pills, and price/xP stat badges, followed by a horizontal bench strip in auto-sub
     order (GKP, Sub 1-3), each sub card carrying the same fixture pill, xP badge, and click-through
     detail dialog as the starting pitch cards. Used by the Command Center, My Squad tab, and
-    Squad Optimizer tab."""
+    Squad Optimizer tab.
+
+    transfer_out_map (player_id -> {"in": PlayerRow, "xp_gain": float}) optionally highlights
+    Suggested Transfers-Out directly on the pitch/bench cards (dashed red border + badge + the
+    suggested incoming replacement's name) -- see render_command_center_tab, the only current
+    caller that passes one; every other caller leaves it None and gets the plain card, unchanged.
+
+    new_player_ids optionally highlights a set of player ids as a "NEW" green signing -- used by
+    render_command_center_tab's own "Projected Starting XI After Suggested Transfers" section,
+    the SECOND render_pitch_view call on that page, to mark exactly who the suggested transfers
+    actually brought into the XI/bench. key_prefix disambiguates that second call's Streamlit
+    widget keys from the first (both render on the same page; Streamlit requires unique keys)."""
     opponent_map = opponent_map or {}
+    transfer_out_map = transfer_out_map or {}
+    new_player_ids = new_player_ids or set()
     rows: dict = {1: [], 2: [], 3: [], 4: []}
     for p in starting_xi:
         rows[p.element_type].append(p)
 
-    with st.container(key="pitch_wrap"):
+    with st.container(key=f"{key_prefix}pitch_wrap"):
         st.markdown(
             '<div class="pitch-markings"><div class="pitch-box-top"></div><div class="pitch-halfway"></div>'
             '<div class="pitch-circle"></div><div class="pitch-box-bottom"></div></div>',
@@ -1542,16 +1781,26 @@ def render_pitch_view(conn, starting_xi, bench, captain_id=None, vice_id=None, o
             # !important justify-content that beats our own CSS (verified live -- it forced
             # space-between regardless of what we set here); assets/style.css owns
             # justify-content for this row exclusively instead.
-            with st.container(key=f"pitch_row_{element_type}", horizontal=True):
+            with st.container(key=f"{key_prefix}pitch_row_{element_type}", horizontal=True):
                 for p in players_in_row:
-                    card_html = _player_card_html(p, p.id == captain_id, p.id == vice_id, opponent_map, metric)
-                    _render_clickable_card(conn, card_html, p, opponent_map, "pcard")
+                    card_html = _player_card_html(
+                        p, p.id == captain_id, p.id == vice_id, opponent_map, metric,
+                        transfer_suggestion=transfer_out_map.get(p.id), is_new_signing=p.id in new_player_ids,
+                    )
+                    _render_clickable_card(conn, card_html, p, opponent_map, f"{key_prefix}pcard")
 
+    if transfer_out_map:
+        st.caption("⇄ dashed red = a suggested transfer-out this gameweek (see the incoming name on the card)")
+    if new_player_ids:
+        st.caption("🟢 dashed green = a new signing from the suggested transfers")
     st.caption("Bench (auto-sub order) -- Sub GKP, then Sub 1/2/3 by descending projected xP")
-    with st.container(key="bench_row", horizontal=True):
+    with st.container(key=f"{key_prefix}bench_row", horizontal=True):
         for i, (p, slot_label) in enumerate(zip(bench, _bench_slot_labels(bench))):
-            card_html = _bench_card_html(p, slot_label, metric, opponent_map, highlight_highest_xp=(i == 1))
-            _render_clickable_card(conn, card_html, p, opponent_map, "bcard")
+            card_html = _bench_card_html(
+                p, slot_label, metric, opponent_map, highlight_highest_xp=(i == 1),
+                transfer_suggestion=transfer_out_map.get(p.id), is_new_signing=p.id in new_player_ids,
+            )
+            _render_clickable_card(conn, card_html, p, opponent_map, f"{key_prefix}bcard")
 
 
 # --- Tab 1: My Squad & Pitch View ----------------------------------------------
@@ -1565,6 +1814,15 @@ def _greedy_swap_suggestions(out_players: list, in_players: list, xp_lookup: dic
     suggestion -- a naive "best replacement per outgoing player" search can recommend the same
     incoming player for several different swaps at once, which isn't executable as a real
     transfer plan since you can only own each player once.
+
+    Also enforces MAX_PLAYERS_PER_TEAM across the whole accepted BATCH, not just each swap
+    checked in isolation against the original squad -- real bug found live: two independently-
+    legal suggestions (each individually taking a club from 2 -> 3 players owned) can still add
+    up to 4 of the same club if they happen to share one, which the old per-swap-only check never
+    caught. out_players is taken as the full current squad (not just candidates to sell) so the
+    starting club counts are real; a candidate whose incoming player would push its club over the
+    limit -- given whichever earlier suggestions in this same batch were already accepted -- is
+    skipped in favor of the next-best candidate instead.
     """
     candidate_pairs = []
     for out_p in out_players:
@@ -1579,13 +1837,20 @@ def _greedy_swap_suggestions(out_players: list, in_players: list, xp_lookup: dic
 
     candidate_pairs.sort(key=lambda s: s["xp_gain"], reverse=True)
 
+    club_counts = Counter(p.team_id for p in out_players)
     suggestions, used_out_ids, used_in_ids = [], set(), set()
     for pair in candidate_pairs:
-        if pair["out"].id in used_out_ids or pair["in"].id in used_in_ids:
+        out_p, in_p = pair["out"], pair["in"]
+        if out_p.id in used_out_ids or in_p.id in used_in_ids:
+            continue
+        net_in_club_count = club_counts[in_p.team_id] + (0 if in_p.team_id == out_p.team_id else 1)
+        if net_in_club_count > optimizer.MAX_PLAYERS_PER_TEAM:
             continue
         suggestions.append(pair)
-        used_out_ids.add(pair["out"].id)
-        used_in_ids.add(pair["in"].id)
+        used_out_ids.add(out_p.id)
+        used_in_ids.add(in_p.id)
+        club_counts[out_p.team_id] -= 1
+        club_counts[in_p.team_id] += 1
         if len(suggestions) >= top_n:
             break
 
@@ -1621,6 +1886,59 @@ def _suggest_transfers_next_gw(conn, squad_ids: list, bank_units: int, horizon_g
     for s in suggestions:
         s["xp_gain_3gw"] = s["xp_gain"]
     return suggestions
+
+
+def _annotate_would_start_after_swap(
+    all_players: dict, squad_rows: list, suggestions: list,
+    min_starter_xmins: Optional[float], risk_lambda: float, formation_lock: Optional[str],
+) -> None:
+    """Mutates each suggestion dict in place, adding 'in_would_start': bool -- whether the
+    suggested incoming player would actually make the REBUILT Starting XI, not just outproject
+    the outgoing player in isolation. _suggest_transfers_next_gw's own xp_gain ranking is a plain
+    same-position 1-for-1 comparison; it says nothing about where the incoming player would
+    actually SIT once they're really in the squad, which can be genuinely surprising when the
+    outgoing player is a bench/low-minutes one (see a real case this caught live: a big xP gain
+    over a benched player who wasn't costing you anything anyway, with the incoming player easily
+    good enough to become an outright starter, not just take over that same bench slot).
+
+    Leaves 'in_would_start' UNSET (key absent, not False) if the incoming player isn't resolvable
+    in `all_players` (the current single-gameweek pool) or the rebuild is infeasible for any
+    reason -- callers should treat a missing key as "unknown," never as "would not start."
+    """
+    for s in suggestions:
+        in_player = all_players.get(s["in"].id)
+        if in_player is None:
+            continue
+        new_squad = [p for p in squad_rows if p.id != s["out"].id] + [in_player]
+        if len(new_squad) != len(squad_rows):
+            continue
+        try:
+            xi, _bench, _formation, _floor, _relaxed = optimizer.solve_starting_xi_with_fallback(
+                new_squad, min_starter_xmins=min_starter_xmins, risk_lambda=risk_lambda, formation_lock=formation_lock,
+            )
+        except OptimizationError:
+            continue
+        s["in_would_start"] = in_player.id in {p.id for p in xi}
+
+
+def _post_transfer_squad(all_players: dict, squad_rows: list, suggestions: list) -> list:
+    """The hypothetical 15-man squad if every suggestion in `suggestions` were actually made --
+    each suggestion's outgoing player removed, its incoming player (looked up fresh in
+    all_players, the current single-gameweek pool, for consistency with squad_rows -- not the
+    suggestion's own PlayerRow object, which came from a different multi-gw-horizon fetch) added.
+    Feeds the "Projected Starting XI After Suggested Transfers" section: rebuilding the WHOLE
+    squad at once (not one swap at a time) is what makes that section correct when two
+    suggestions are taken together, e.g. the real case that motivated this -- a suggested-out
+    player who was already benched freeing a squad slot doesn't free a STARTING slot, so the
+    incoming replacement (if good enough to start) actually displaces whichever different player
+    was the current XI's weakest link, not the specific player being sold."""
+    out_ids = {s["out"].id for s in suggestions}
+    new_squad = [p for p in squad_rows if p.id not in out_ids]
+    for s in suggestions:
+        in_player = all_players.get(s["in"].id)
+        if in_player is not None and in_player.id not in {p.id for p in new_squad}:
+            new_squad.append(in_player)
+    return new_squad
 
 
 def render_draft_builder(conn):
@@ -1757,11 +2075,19 @@ def render_squad_tab(conn):
         return
 
     try:
-        starting_xi, bench, formation = optimizer.solve_starting_xi(squad_rows, min_starter_xmins=_min_starter_xmins(), risk_lambda=_risk_lambda(), formation_lock=_formation_lock())
-        captain_info = optimizer.get_captain_recommendations(conn, [p.id for p in squad_rows], ensemble_weights=_ensemble_weights(), min_starter_xmins=_min_starter_xmins(), risk_lambda=_risk_lambda(), formation_lock=_formation_lock())
+        starting_xi, bench, formation, floor_used, was_relaxed = optimizer.solve_starting_xi_with_fallback(
+            squad_rows, min_starter_xmins=_min_starter_xmins(), risk_lambda=_risk_lambda(), formation_lock=_formation_lock(),
+        )
+        captain_info = optimizer.get_captain_recommendations(
+            conn, [p.id for p in squad_rows], ensemble_weights=_ensemble_weights(),
+            min_starter_xmins=floor_used, risk_lambda=_risk_lambda(), formation_lock=_formation_lock(),
+        )
     except OptimizationError as exc:
         st.error(str(exc))
         return
+
+    if was_relaxed:
+        st.warning(_starter_floor_relaxed_message(floor_used))
 
     captain_id = captain_info["captain"]["player"].id
     vice_captain = captain_info.get("vice_captain")
@@ -1918,11 +2244,18 @@ def render_optimizer_tab(conn):
 
         with pitch_tab:
             try:
-                starting_xi, bench, formation = optimizer.solve_starting_xi(squad, min_starter_xmins=_min_starter_xmins(), risk_lambda=_risk_lambda(), formation_lock=_formation_lock())
-                captain_info = optimizer.get_captain_recommendations(conn, [p.id for p in squad], ensemble_weights=_ensemble_weights(), min_starter_xmins=_min_starter_xmins(), risk_lambda=_risk_lambda(), formation_lock=_formation_lock())
+                starting_xi, bench, formation, floor_used, was_relaxed = optimizer.solve_starting_xi_with_fallback(
+                    squad, min_starter_xmins=_min_starter_xmins(), risk_lambda=_risk_lambda(), formation_lock=_formation_lock(),
+                )
+                captain_info = optimizer.get_captain_recommendations(
+                    conn, [p.id for p in squad], ensemble_weights=_ensemble_weights(),
+                    min_starter_xmins=floor_used, risk_lambda=_risk_lambda(), formation_lock=_formation_lock(),
+                )
             except OptimizationError as exc:
                 st.error(f"Could not build pitch view: {exc}")
             else:
+                if was_relaxed:
+                    st.warning(_starter_floor_relaxed_message(floor_used))
                 captain_id = captain_info["captain"]["player"].id
                 vice_captain = captain_info.get("vice_captain")
                 vice_id = vice_captain["player"].id if vice_captain else None
@@ -2470,11 +2803,19 @@ def render_live_radar_tab(conn) -> None:
     if not using_real_picks:
         try:
             squad_rows = [p for p in optimizer.fetch_players(conn, ensemble_weights=_ensemble_weights()) if p.id in squad_ids]
-            starting_xi, bench, _formation = optimizer.solve_starting_xi(squad_rows, min_starter_xmins=_min_starter_xmins(), risk_lambda=_risk_lambda(), formation_lock=_formation_lock())
-            captain_info = optimizer.get_captain_recommendations(conn, squad_ids, ensemble_weights=_ensemble_weights(), min_starter_xmins=_min_starter_xmins(), risk_lambda=_risk_lambda(), formation_lock=_formation_lock())
+            starting_xi, bench, _formation, floor_used, was_relaxed = optimizer.solve_starting_xi_with_fallback(
+                squad_rows, min_starter_xmins=_min_starter_xmins(), risk_lambda=_risk_lambda(), formation_lock=_formation_lock(),
+            )
+            captain_info = optimizer.get_captain_recommendations(
+                conn, squad_ids, ensemble_weights=_ensemble_weights(),
+                min_starter_xmins=floor_used, risk_lambda=_risk_lambda(), formation_lock=_formation_lock(),
+            )
         except OptimizationError as exc:
             st.error(str(exc))
             return
+
+        if was_relaxed:
+            st.warning(_starter_floor_relaxed_message(floor_used))
 
         captain_id = captain_info["captain"]["player"].id
         vice_captain = captain_info.get("vice_captain")
@@ -2594,11 +2935,19 @@ def _render_replay_mode_expander(conn) -> None:
         squad_ids = st.session_state.squad_ids
         try:
             squad_rows = [p for p in optimizer.fetch_players(conn, ensemble_weights=_ensemble_weights()) if p.id in squad_ids]
-            starting_xi, bench, _formation = optimizer.solve_starting_xi(squad_rows, min_starter_xmins=_min_starter_xmins(), risk_lambda=_risk_lambda(), formation_lock=_formation_lock())
-            captain_info = optimizer.get_captain_recommendations(conn, squad_ids, ensemble_weights=_ensemble_weights(), min_starter_xmins=_min_starter_xmins(), risk_lambda=_risk_lambda(), formation_lock=_formation_lock())
+            starting_xi, bench, _formation, floor_used, was_relaxed = optimizer.solve_starting_xi_with_fallback(
+                squad_rows, min_starter_xmins=_min_starter_xmins(), risk_lambda=_risk_lambda(), formation_lock=_formation_lock(),
+            )
+            captain_info = optimizer.get_captain_recommendations(
+                conn, squad_ids, ensemble_weights=_ensemble_weights(),
+                min_starter_xmins=floor_used, risk_lambda=_risk_lambda(), formation_lock=_formation_lock(),
+            )
         except OptimizationError as exc:
             st.error(str(exc))
             return
+
+        if was_relaxed:
+            st.warning(_starter_floor_relaxed_message(floor_used))
 
         captain_id = captain_info["captain"]["player"].id
         vice_captain = captain_info.get("vice_captain")

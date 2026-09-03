@@ -837,12 +837,19 @@ def simulate_season(
     initial_budget: float = 100.0,
     risk_profile: str = "balanced",
     verbose: bool = True,
+    max_gameweeks: Optional[int] = None,
 ) -> SeasonReport:
     """Runs the full walk-forward backtest for one historical `season` (vaastav folder naming,
     e.g. "2024-25") and returns a SeasonReport. Stops early (rather than raising) if the archive's
     per-gameweek stats run out before gameweek 38 -- either the season genuinely had fewer weeks
     played so far (an in-progress current season) or the archive itself doesn't cover it that far;
     either way, whatever gameweeks WERE available are still reported on.
+
+    `max_gameweeks` optionally caps the walk forward short of the full 38 (e.g. for a quick GW1-8
+    smoke run) -- purely a loop bound, it doesn't change how any single gameweek is scored. Note
+    the whole-season fixture SCHEDULE (used for chip-window scanning, e.g. gw_density/
+    set1_fh_target_gw below) is still computed from the full season regardless of this cap; that's
+    legitimate pre-match public info, not a lookahead-bias violation -- see the module docstring.
 
     See the module docstring for the full no-lookahead-bias design and documented simplifications.
     """
@@ -882,7 +889,8 @@ def simulate_season(
     chips_used = {1: {}, 2: {}}  # half -> {chip_code: ChipActivation}
     set2_plan: Optional[dict] = None
 
-    for gw in range(1, MAX_GAMEWEEKS + 1):
+    last_gw = min(MAX_GAMEWEEKS, max_gameweeks) if max_gameweeks else MAX_GAMEWEEKS
+    for gw in range(1, last_gw + 1):
         try:
             raw_rows = fetch_vaastav_csv(config.VAASTAV_GW_STATS_CSV_TEMPLATE.format(season=season, gw=gw))
         except FPLAPIError:
@@ -1154,11 +1162,16 @@ def main(argv: Optional[list] = None) -> None:
         help="Risk/ownership profile for Starting XI & captaincy selection (default: balanced)",
     )
     parser.add_argument("--quiet", action="store_true", help="Suppress per-gameweek progress output")
+    parser.add_argument(
+        "--max-gameweeks", type=int, default=None,
+        help="Stop the walk-forward after this many gameweeks instead of the full 38 (e.g. a quick GW1-8 smoke run)",
+    )
     args = parser.parse_args(argv)
 
     try:
         report = simulate_season(
             args.season, initial_budget=args.budget, risk_profile=args.risk_profile, verbose=not args.quiet,
+            max_gameweeks=args.max_gameweeks,
         )
     except FPLAPIError as exc:
         print(f"Could not load season {args.season!r} from the vaastav archive: {exc}", file=sys.stderr)

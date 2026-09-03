@@ -3,8 +3,8 @@ import csv
 import io
 import sqlite3
 import time
-from datetime import date
-from typing import Optional
+from datetime import date, datetime, timezone
+from typing import Callable, Optional
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -88,6 +88,15 @@ class FPLClient:
         url = config.EVENT_LIVE_URL_TEMPLATE.format(event=event)
         return self._get_json(url)
 
+    def get_element_summary(self, player_id: int) -> dict:
+        """One player's {'fixtures', 'history', 'history_past'} -- 'history' is this season's
+        per-gameweek breakdown (minutes/xG/xA/starts per round), 'history_past' is their full
+        prior-season totals, one row per season. Neither is available in bulk anywhere else --
+        bootstrap-static only ever carries this season's CUMULATIVE totals. Powers
+        sync_player_history's recent-form rolling window and prior-season cold-start fallback."""
+        url = config.ELEMENT_SUMMARY_URL_TEMPLATE.format(player_id=player_id)
+        return self._get_json(url)
+
 
 # --- Ingestion: raw API payloads -> validated Pydantic models -> SQLite -----
 
@@ -138,12 +147,14 @@ def sync_players(conn: sqlite3.Connection, bootstrap: dict) -> None:
                               form, total_points, ep_next, xg, xa, xgi, status, news,
                               xg_per_90, xa_per_90, saves_per_90, defensive_contribution_per_90, starts_per_90,
                               starts, chance_of_playing_next_round, penalties_order, corners_order,
-                              transfers_in_event, transfers_out_event)
+                              transfers_in_event, transfers_out_event, expected_goals_conceded_per_90,
+                              cost_change_event, price_change_percent)
         VALUES (:id, :web_name, :team_id, :element_type, :now_cost, :selected_by_percent,
                 :form, :total_points, :ep_next, :xg, :xa, :xgi, :status, :news,
                 :xg_per_90, :xa_per_90, :saves_per_90, :defensive_contribution_per_90, :starts_per_90,
                 :starts, :chance_of_playing_next_round, :penalties_order, :corners_order,
-                :transfers_in_event, :transfers_out_event)
+                :transfers_in_event, :transfers_out_event, :expected_goals_conceded_per_90,
+                :cost_change_event, :price_change_percent)
         ON CONFLICT(id) DO UPDATE SET
             web_name=excluded.web_name,
             team_id=excluded.team_id,
@@ -168,11 +179,123 @@ def sync_players(conn: sqlite3.Connection, bootstrap: dict) -> None:
             penalties_order=excluded.penalties_order,
             corners_order=excluded.corners_order,
             transfers_in_event=excluded.transfers_in_event,
-            transfers_out_event=excluded.transfers_out_event
+            transfers_out_event=excluded.transfers_out_event,
+            expected_goals_conceded_per_90=excluded.expected_goals_conceded_per_90,
+            cost_change_event=excluded.cost_change_event,
+            price_change_percent=excluded.price_change_percent
         """,
         [p.model_dump() for p in players],
     )
     conn.commit()
+
+
+def sync_player_history(
+    conn: sqlite3.Connection,
+    client: FPLClient,
+    player_ids: list,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+) -> dict:
+    """Populates player_season_history (prior season's real per-90-backing totals -- see
+    optimizer's cold-start fallback) and player_gw_history (this season's per-gameweek breakdown
+    -- see optimizer.recent_form_rate's rolling window) from element-summary/{id}/, one request
+    per player -- there's no bulk equivalent anywhere in the public API.
+
+    This is meaningfully slower than the rest of the sync (one HTTP round-trip per player, easily
+    minutes for the full ~600-player pool) -- deliberately a SEPARATE, opt-in sync step from
+    sync_players/sync_fixtures rather than folded into the regular "Sync Live FPL Data" button, so
+    a routine sync stays fast. progress_callback, if given, is called after every player as
+    fn(done: int, total: int, web_name: str) -- e.g. to drive a Streamlit progress bar.
+
+    A single player's request failing (404, timeout, no history yet) is skipped, not fatal to the
+    whole sync -- returns {"synced": int, "failed": list[int]} so the caller can report both.
+    """
+    total = len(player_ids)
+    synced = 0
+    failed: list = []
+    season_rows: list = []
+    gw_rows: list = []
+
+    for i, player_id in enumerate(player_ids, start=1):
+        try:
+            summary = client.get_element_summary(player_id)
+        except FPLAPIError:
+            failed.append(player_id)
+        else:
+            history_past = summary.get("history_past") or []
+            if history_past:
+                last_season = history_past[-1]  # oldest-first list -- last entry is most recent
+                season_rows.append({
+                    "player_id": player_id,
+                    "season_name": last_season.get("season_name", ""),
+                    "minutes": int(last_season.get("minutes") or 0),
+                    "starts": int(last_season.get("starts") or 0),
+                    "total_points": int(last_season.get("total_points") or 0),
+                    "expected_goals": _to_float_safe(last_season.get("expected_goals")),
+                    "expected_assists": _to_float_safe(last_season.get("expected_assists")),
+                    "expected_goals_conceded": _to_float_safe(last_season.get("expected_goals_conceded")),
+                })
+            for gw_row in summary.get("history") or []:
+                gw_rows.append({
+                    "player_id": player_id,
+                    "round": gw_row.get("round"),
+                    "minutes": int(gw_row.get("minutes") or 0),
+                    "starts": int(gw_row.get("starts") or 0),
+                    "expected_goals": _to_float_safe(gw_row.get("expected_goals")),
+                    "expected_assists": _to_float_safe(gw_row.get("expected_assists")),
+                    "expected_goals_conceded": _to_float_safe(gw_row.get("expected_goals_conceded")),
+                    "total_points": int(gw_row.get("total_points") or 0),
+                })
+            synced += 1
+        if progress_callback is not None:
+            progress_callback(i, total, "")
+
+    if season_rows:
+        conn.executemany(
+            """
+            INSERT INTO player_season_history (player_id, season_name, minutes, starts, total_points,
+                                                expected_goals, expected_assists, expected_goals_conceded)
+            VALUES (:player_id, :season_name, :minutes, :starts, :total_points,
+                    :expected_goals, :expected_assists, :expected_goals_conceded)
+            ON CONFLICT(player_id, season_name) DO UPDATE SET
+                minutes=excluded.minutes,
+                starts=excluded.starts,
+                total_points=excluded.total_points,
+                expected_goals=excluded.expected_goals,
+                expected_assists=excluded.expected_assists,
+                expected_goals_conceded=excluded.expected_goals_conceded
+            """,
+            season_rows,
+        )
+    if gw_rows:
+        conn.executemany(
+            """
+            INSERT INTO player_gw_history (player_id, round, minutes, starts, expected_goals,
+                                            expected_assists, expected_goals_conceded, total_points)
+            VALUES (:player_id, :round, :minutes, :starts, :expected_goals,
+                    :expected_assists, :expected_goals_conceded, :total_points)
+            ON CONFLICT(player_id, round) DO UPDATE SET
+                minutes=excluded.minutes,
+                starts=excluded.starts,
+                expected_goals=excluded.expected_goals,
+                expected_assists=excluded.expected_assists,
+                expected_goals_conceded=excluded.expected_goals_conceded,
+                total_points=excluded.total_points
+            """,
+            gw_rows,
+        )
+    conn.commit()
+    return {"synced": synced, "failed": failed}
+
+
+def _to_float_safe(v) -> float:
+    """Same empty/None/string-safe coercion as models._to_float, but standalone -- used here for
+    raw element-summary dicts that never go through a Pydantic model at all."""
+    if v is None or v == "":
+        return 0.0
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def sync_fixtures(conn: sqlite3.Connection, fixtures_payload: list) -> None:
@@ -395,6 +518,34 @@ FT_CAP = 5  # matches the current FPL banked-FT limit (transfer_planner.FREE_TRA
 _UNLIMITED_TRANSFER_CHIP_NAMES = {"wildcard", "freehit"}  # these gameweeks don't touch the FT bank
 
 
+def deadline_has_passed(deadline_time: Optional[str]) -> bool:
+    """True once a gameweek's real deadline_time (ISO 8601, e.g. '2026-08-15T17:30:00Z' as
+    returned by bootstrap-static) is actually in the past -- computed directly from the raw
+    timestamp rather than trusting FPL's own is_current/is_next flags on that gameweek's row.
+
+    Those flags are FPL's own backend's job to flip, and it can leave is_current stuck False for
+    HOURS after a deadline genuinely passes -- most visibly right after the GW1 deadline, when
+    picks are already locked and fetchable but bootstrap-static still reports the season as not
+    "current" yet. Callers that need to know whether a gameweek's picks should already be live
+    should check this instead of (or alongside) is_current. Returns False for missing/unparseable
+    input so callers can safely fall back to the flag-based logic.
+    """
+    if not deadline_time:
+        return False
+    try:
+        deadline = datetime.fromisoformat(deadline_time.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if deadline.tzinfo is None:
+        # A bare (offset-less) ISO string, e.g. '2026-08-15T17:30:00' -- bootstrap-static always
+        # sends 'Z', but treat a naive timestamp as UTC rather than raising when compared below.
+        deadline = deadline.replace(tzinfo=timezone.utc)
+    try:
+        return datetime.now(timezone.utc) >= deadline
+    except TypeError:
+        return False
+
+
 def estimate_free_transfers(history_payload: Optional[dict]) -> int:
     """The public FPL API doesn't expose "free transfers currently banked" directly -- this
     reconstructs it by replaying the manager's own gameweek-by-gameweek transfer history from
@@ -554,6 +705,8 @@ def fetch_minileague_squads(client: FPLClient, league_id: int, current_gw: int, 
 
 PRICE_DROP_NET_TRANSFER_THRESHOLD = -100_000  # net (in - out) at/below this reads as drop risk
 PRICE_RISE_NET_TRANSFER_THRESHOLD = 100_000  # net (in - out) at/above this reads as rise likelihood
+PRICE_CHANGE_PERCENT_THRESHOLD = 50.0  # |price_change_percent| at/beyond this also reads as a
+# real risk, independent of the net-transfers proxy -- see compute_price_change_alerts.
 
 
 def compute_price_change_alerts(
@@ -561,18 +714,34 @@ def compute_price_change_alerts(
     squad_ids: Optional[list] = None,
     drop_threshold: int = PRICE_DROP_NET_TRANSFER_THRESHOLD,
     rise_threshold: int = PRICE_RISE_NET_TRANSFER_THRESHOLD,
+    percent_threshold: float = PRICE_CHANGE_PERCENT_THRESHOLD,
 ) -> list:
-    """Players at risk of an overnight price move, from today's transfers_in_event/
-    transfers_out_event momentum (see sync_players) -- a heuristic proxy for FPL's own
-    undisclosed internal "value form" algorithm, not a guaranteed predictor: real price changes
-    also depend on each player's individual ownership base and how many days they've already
-    trended, neither of which the public API exposes. Restricted to squad_ids when given (the
-    Command Center price alert pill), otherwise scans the full player pool.
+    """Players at risk of an overnight price move. Two independent signals, either of which can
+    trigger an alert:
 
-    Returns [{"player_id", "web_name", "now_cost", "net_transfers", "direction": "rise"|"drop"}],
-    sorted by |net_transfers| descending (biggest movers first).
+    1. Today's transfers_in_event/transfers_out_event momentum (see sync_players) -- a heuristic
+       proxy for FPL's own undisclosed internal "value form" algorithm, not a guaranteed
+       predictor: real price changes also depend on each player's individual ownership base and
+       how many days they've already trended, neither of which the public API exposes.
+    2. price_change_percent -- FPL's own undocumented (but empirically direct) "progress toward
+       the next price change" figure, roughly -100..100. A tighter read than transfer momentum
+       alone: a small-ownership player can cross FPL's own real threshold on modest absolute
+       transfer counts the net-transfers heuristic would miss entirely, and vice versa.
+
+    A player whose price has ALREADY moved today (cost_change_event != 0, also from sync_players)
+    is excluded outright -- nothing left to act on for today, and surfacing a "still at risk" pill
+    for something that's already resolved would be actively misleading.
+
+    Restricted to squad_ids when given (the Command Center price alert pill), otherwise scans the
+    full player pool.
+
+    Returns [{"player_id", "web_name", "now_cost", "net_transfers", "price_change_percent",
+    "direction": "rise"|"drop"}], sorted by whichever signal's magnitude is larger, descending.
     """
-    query = "SELECT id, web_name, now_cost, transfers_in_event, transfers_out_event FROM players WHERE status != 'u'"
+    query = (
+        "SELECT id, web_name, now_cost, transfers_in_event, transfers_out_event, "
+        "cost_change_event, price_change_percent FROM players WHERE status != 'u'"
+    )
     params: list = []
     if squad_ids:
         placeholders = ",".join(["?"] * len(squad_ids))
@@ -582,18 +751,21 @@ def compute_price_change_alerts(
 
     alerts = []
     for row in rows:
+        if (row["cost_change_event"] or 0) != 0:
+            continue  # already moved today -- nothing actionable left to flag
         net = (row["transfers_in_event"] or 0) - (row["transfers_out_event"] or 0)
-        if net <= drop_threshold:
+        percent = row["price_change_percent"] or 0.0
+        if net <= drop_threshold or percent <= -percent_threshold:
             direction = "drop"
-        elif net >= rise_threshold:
+        elif net >= rise_threshold or percent >= percent_threshold:
             direction = "rise"
         else:
             continue
         alerts.append({
             "player_id": row["id"], "web_name": row["web_name"], "now_cost": row["now_cost"],
-            "net_transfers": net, "direction": direction,
+            "net_transfers": net, "price_change_percent": percent, "direction": direction,
         })
-    alerts.sort(key=lambda a: abs(a["net_transfers"]), reverse=True)
+    alerts.sort(key=lambda a: max(abs(a["net_transfers"]) / 100_000, abs(a["price_change_percent"])), reverse=True)
     return alerts
 
 

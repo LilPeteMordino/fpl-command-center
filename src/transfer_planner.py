@@ -42,10 +42,13 @@ from src.optimizer import (
     captaincy_candidates,
     captaincy_score,
     ensemble_from_sources,
+    ep_next_blend_weight,
     has_set_piece_duty,
     is_before_gw1_deadline,
     is_cold_start_pool,
     is_vice_eligible,
+    last_season_rate_by_player_lookup,
+    recent_form_by_player_lookup,
     set_piece_label,
     solve_squad,
     solve_starting_xi,
@@ -107,6 +110,7 @@ class _RawPlayerStats:
     selected_by_percent: float = 0.0  # xMins pre-season fallback also reads ownership
     penalties_order: Optional[int] = None
     corners_order: Optional[int] = None
+    expected_goals_conceded_per_90: float = 0.0  # see optimizer._blend_player_xga
 
 
 @dataclass
@@ -130,6 +134,13 @@ class GWPlan:
     initial_selection: bool = False  # True for GW1 while still before its deadline -- see plan_transfers
     transfers_in_ids: list = field(default_factory=list)  # player ids, same order as transfers_in
     transfers_out_ids: list = field(default_factory=list)  # player ids, same order as transfers_out
+    hit_justification_margin: Optional[float] = None  # the lookahead-weighted decision_score margin
+    # this hit cleared over the best hit_cost == 0 alternative that same gameweek (see plan_transfers'
+    # hurdle-rate comment) -- NOT the same number as net_points, and not comparable to it: net_points
+    # is this single gameweek's own final score (which can legitimately be LOWER than a cheaper
+    # no-hit alternative's net_points, if the hit is being justified by weighted fixture value a
+    # gameweek or two further out -- see LOOKAHEAD_WEIGHTS). None when hit_cost == 0 (nothing to
+    # justify) or for the free/unlimited GW1 initial-selection step (no hurdle applies there at all).
 
 
 # --- Horizon gameweeks & per-gw fixture data --------------------------------
@@ -171,11 +182,12 @@ def _team_fixtures_by_event(conn, event_ids: list) -> dict:
     return fixtures
 
 
-def _venue_scaled_breakdown(raw_stats: _RawPlayerStats, leg: _FixtureLeg):
+def _venue_scaled_breakdown(raw_stats: _RawPlayerStats, leg: _FixtureLeg, games_played: int):
     """One fixture leg's positional xP breakdown, with the existing home/away venue multiplier
     layered on top of calculate_positional_xp's own fixture-difficulty awareness (clean-sheet
-    probability for DEF/GKP, fixture-ease multiplier for attackers)."""
-    breakdown = calculate_positional_xp(raw_stats, leg.difficulty)
+    probability for DEF/GKP, fixture-ease multiplier for attackers). games_played is the player's
+    team's finished-fixture count this season -- see optimizer.calculate_positional_xp."""
+    breakdown = calculate_positional_xp(raw_stats, leg.difficulty, games_played)
     venue_mult = HOME_FIXTURE_MULTIPLIER if leg.is_home else AWAY_FIXTURE_MULTIPLIER
     return replace(
         breakdown,
@@ -211,6 +223,8 @@ def fetch_multi_gw_projections(conn, event_ids: list, ensemble_weights: Optional
     fixtures_by_team_event = _team_fixtures_by_event(conn, event_ids)
     games_played_by_team = team_games_played(conn)
     preseason_by_player = database.get_preseason_adjustments(conn)
+    recent_form_by_player = recent_form_by_player_lookup(conn)
+    last_season_rate_by_player = last_season_rate_by_player_lookup(conn)
     external_rows = database.get_external_projections(conn, event_ids=event_ids, source=list(ensemble_weights.keys()))
     ensemble_sources_by_player_event: dict = {}
     xmins_sources_by_player_event: dict = {}
@@ -222,9 +236,10 @@ def fetch_multi_gw_projections(conn, event_ids: list, ensemble_weights: Optional
     rows = conn.execute(
         """
         SELECT p.id, p.web_name, p.team_id, t.name AS team_name, p.element_type, p.now_cost,
-               p.selected_by_percent, p.status,
+               p.selected_by_percent, p.status, p.ep_next,
                p.xg_per_90, p.xa_per_90, p.saves_per_90, p.defensive_contribution_per_90, p.starts_per_90,
-               p.starts, p.chance_of_playing_next_round, p.penalties_order, p.corners_order
+               p.starts, p.chance_of_playing_next_round, p.penalties_order, p.corners_order,
+               p.expected_goals_conceded_per_90
         FROM players p
         JOIN teams t ON t.id = p.team_id
         WHERE p.status != 'u'
@@ -233,12 +248,21 @@ def fetch_multi_gw_projections(conn, event_ids: list, ensemble_weights: Optional
 
     projections = {}
     for row in rows:
+        # Same recent-form rolling window / prior-season cold-start prior as optimizer.fetch_players
+        # -- see that function's own comment for why either overrides the flat cumulative rate.
+        team_games = games_played_by_team.get(row["team_id"], 0)
+        row_xg_per_90, row_xa_per_90 = row["xg_per_90"] or 0.0, row["xa_per_90"] or 0.0
+        if team_games == 0 and row["id"] in last_season_rate_by_player:
+            row_xg_per_90, row_xa_per_90 = last_season_rate_by_player[row["id"]]
+        elif row["id"] in recent_form_by_player:
+            row_xg_per_90, row_xa_per_90 = recent_form_by_player[row["id"]]
+
         raw_stats = _RawPlayerStats(
             element_type=row["element_type"],
             status=row["status"],
             now_cost=row["now_cost"],
-            xg_per_90=row["xg_per_90"] or 0.0,
-            xa_per_90=row["xa_per_90"] or 0.0,
+            xg_per_90=row_xg_per_90,
+            xa_per_90=row_xa_per_90,
             saves_per_90=row["saves_per_90"] or 0.0,
             defensive_contribution_per_90=row["defensive_contribution_per_90"] or 0.0,
             starts_per_90=row["starts_per_90"] or 0.0,
@@ -247,6 +271,7 @@ def fetch_multi_gw_projections(conn, event_ids: list, ensemble_weights: Optional
             selected_by_percent=row["selected_by_percent"] or 0.0,
             penalties_order=row["penalties_order"],
             corners_order=row["corners_order"],
+            expected_goals_conceded_per_90=row["expected_goals_conceded_per_90"] or 0.0,
         )
         adjustment = preseason_by_player.get(row["id"])
         if adjustment:
@@ -257,7 +282,8 @@ def fetch_multi_gw_projections(conn, event_ids: list, ensemble_weights: Optional
             if adjustment.get("preseason_set_pieces") and raw_stats.corners_order != 1:
                 raw_stats = replace(raw_stats, corners_order=1)
 
-        baseline_xmins = calculate_baseline_xmins(raw_stats, games_played_by_team.get(row["team_id"], 0))
+        team_games_played_n = games_played_by_team.get(row["team_id"], 0)
+        baseline_xmins = calculate_baseline_xmins(raw_stats, team_games_played_n)
         custom_xmins = adjustment.get("custom_xmins_override") if adjustment else None
 
         gw_xp, gw_difficulty, gw_has_fixture, gw_fixture_count, gw_breakdown, gw_xmins, gw_is_home = {}, {}, {}, {}, {}, {}, {}
@@ -276,7 +302,7 @@ def fetch_multi_gw_projections(conn, event_ids: list, ensemble_weights: Optional
             # for the Talisman Penalty-Taker captaincy boost (see optimizer._is_talisman_boost_favorable).
             gw_is_home[event_id] = any(leg.is_home for leg in legs) if legs else None
             if legs:
-                leg_breakdowns = [_venue_scaled_breakdown(raw_stats, leg) for leg in legs]
+                leg_breakdowns = [_venue_scaled_breakdown(raw_stats, leg, team_games_played_n) for leg in legs]
                 internal_total = round(sum(b.total for b in leg_breakdowns), 3)
                 representative = leg_breakdowns[0]  # for display; overwritten below if applicable
 
@@ -287,7 +313,19 @@ def fetch_multi_gw_projections(conn, event_ids: list, ensemble_weights: Optional
                 # neither uploaded source covers this player. Either way, the result is then
                 # scaled to Effective xP by xmins/90, and that scaled total is carried onto the
                 # representative breakdown so the figure shown in the UI matches gw_xp exactly.
-                raw_total = ensemble_xp if ensemble_xp is not None else internal_total
+                if ensemble_xp is not None:
+                    raw_total = ensemble_xp
+                elif event_id == event_ids[0] and row["ep_next"] is not None:
+                    # FPL's own ep_next describes only the immediate next round (bootstrap-static
+                    # carries no further-out figure), so it's only a candidate blend input for the
+                    # nearest gameweek in this horizon -- see optimizer.blend_ep_next_fallback's
+                    # module-level comment for why (and when its weight fades to 0) this blend
+                    # exists at all. Further-out weeks fall through to the plain internal total,
+                    # same as before.
+                    weight = ep_next_blend_weight(row["starts"] or 0)
+                    raw_total = round(weight * row["ep_next"] + (1 - weight) * internal_total, 3)
+                else:
+                    raw_total = internal_total
 
                 # Pre-season OOP/penalty-duty overrides, applied after the ensemble decision (same
                 # order as optimizer.apply_preseason_adjustment) so they adjust whatever total is
@@ -667,19 +705,33 @@ def plan_transfers(
             # Hurdle rate: only a candidate whose margin over holding clears transfer_hurdle_xp is
             # eligible to be picked over t=0 -- see plan_transfers' docstring. A candidate that
             # actually spends a hit (hit_cost > 0, i.e. t exceeds that gameweek's free transfers)
-            # must clear the separate, stricter hit_transfer_hurdle_xp on that same margin instead.
-            baseline_score = candidates[0]["decision_score"]
+            # must clear the separate, stricter hit_transfer_hurdle_xp instead -- but critically,
+            # measured against the best FREE alternative (any t with hit_cost == 0, which is
+            # sometimes t=1+ rather than t=0 itself, e.g. this gameweek already has a banked free
+            # transfer), NOT against t=0 (hold) directly. Comparing a hit candidate's margin
+            # against pure hold lets a genuinely good free transfer's own gain "carry" one or more
+            # much weaker EXTRA hit-transfers bundled on top of it -- the bundle as a whole clears
+            # the hold-vs-hurdle bar easily even when the incremental hit-transfer(s) alone barely
+            # beat the free option and would never clear hit_transfer_hurdle_xp on their own merit.
+            hold_score = candidates[0]["decision_score"]
+            free_score = max((c["decision_score"] for c in candidates.values() if c["hit_cost"] == 0), default=hold_score)
             eligible = [
                 c for t, c in candidates.items()
                 if t == 0 or (
-                    (c["decision_score"] - baseline_score)
-                    >= (hit_transfer_hurdle_xp if c["hit_cost"] > 0 else transfer_hurdle_xp)
+                    (c["decision_score"] - hold_score) >= transfer_hurdle_xp if c["hit_cost"] == 0
+                    else (c["decision_score"] - free_score) >= hit_transfer_hurdle_xp
                 )
             ]
             best = max(eligible, key=lambda c: c["decision_score"])
 
         if best is None:
             raise OptimizationError(f"No feasible squad found for gameweek {event_id}.")
+
+        hit_justification_margin = (
+            round(best["decision_score"] - free_score, 3)
+            if not is_free_gw1_step and best["hit_cost"] > 0
+            else None
+        )
 
         transfers_in = sorted(best["squad_ids"] - squad_ids)
         transfers_out = sorted(squad_ids - best["squad_ids"])
@@ -725,6 +777,7 @@ def plan_transfers(
                 gross_points=gross_points,
                 net_points=net_points,
                 initial_selection=is_free_gw1_step,
+                hit_justification_margin=hit_justification_margin,
             )
         )
 
@@ -846,13 +899,35 @@ def _transfer_pair_rationale(out_player, in_player, out_fdr, in_fdr, horizon_gws
 
 def _hit_or_roll_rationale(plan: GWPlan) -> "RationaleBullet":
     """Justifies a -4 (or larger) hit by its expected point delta, or explains banking a free
-    transfer when the roadmap chooses to hold instead."""
+    transfer when the roadmap chooses to hold instead.
+
+    Bug found live: this used to quote plan.net_points itself as "the net gain" that justified a
+    hit -- but net_points is this single gameweek's own absolute score, not a margin over
+    anything. A hit-taking squad is chosen because it wins on plan_transfers' lookahead-weighted
+    decision_score across several gameweeks (see LOOKAHEAD_WEIGHTS), which can legitimately mean
+    THIS gameweek's own net_points ends up lower than the best free-only alternative would have
+    scored -- the hit pays for itself over the next gameweek or two, not necessarily this one. The
+    old wording read as "you're net_points points better off," which is simply false when that's
+    the case, and is exactly the kind of thing that looks like a self-contradictory recommendation
+    from the outside. Now quotes plan.hit_justification_margin -- the actual lookahead-weighted
+    margin over the best hit_cost == 0 alternative that the hurdle rate checked -- and says
+    explicitly that it's a multi-gameweek margin, not this week's own points."""
     if plan.transfers_made and plan.hit_cost:
+        if plan.hit_justification_margin is not None:
+            margin_text = (
+                f"a projected +{plan.hit_justification_margin:.1f} xP margin over the best FREE "
+                f"alternative that gameweek, weighted across the next few gameweeks' fixtures -- "
+                f"NOT necessarily GW{plan.event_id}'s own net points alone, which can legitimately "
+                f"come out lower than the free alternative would have scored this single week; the "
+                f"hit is expected to pay for itself over the following gameweek(s) instead"
+            )
+        else:
+            margin_text = f"a net gain of {plan.net_points:+.1f} xP after the hit"
         return RationaleBullet(
             text=(
                 f"GW{plan.event_id}: taking a -{plan.hit_cost}pt hit for {plan.transfers_made} transfer(s) "
-                f"is justified by a net gain of {plan.net_points:+.1f} xP after the hit -- the roadmap only "
-                f"ever takes a hit when the ILP finds it nets a positive return."
+                f"is justified by {margin_text} -- the roadmap only ever takes a hit when the ILP finds "
+                f"it clears the stricter hit-only hurdle."
             ),
             tags=[],
         )

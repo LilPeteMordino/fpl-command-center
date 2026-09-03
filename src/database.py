@@ -54,6 +54,45 @@ CREATE TABLE IF NOT EXISTS players (
     transfers_out_event INTEGER
 );
 
+-- One row per player+season for their PRIOR season's real per-90 rates (see
+-- fpl_api.sync_player_history) -- FPL's bootstrap-static carries no season-to-season history
+-- itself, only element-summary/{id}/'s history_past does, hence a dedicated table rather than
+-- more players columns. Used as a cold-start fallback that's actually grounded in this specific
+-- player's own real output, instead of only the price/ownership heuristic (see
+-- optimizer._preseason_starts_rate_fallback) -- see optimizer.calculate_positional_xp's
+-- games_played==0 branch. Keyed by season_name so a mid-season resync doesn't need to re-fetch
+-- what's already there, and so a player with a gap season (loan, injury) still has their most
+-- recent real season on record rather than nothing.
+CREATE TABLE IF NOT EXISTS player_season_history (
+    player_id INTEGER NOT NULL REFERENCES players(id),
+    season_name TEXT NOT NULL,
+    minutes INTEGER NOT NULL DEFAULT 0,
+    starts INTEGER NOT NULL DEFAULT 0,
+    total_points INTEGER NOT NULL DEFAULT 0,
+    expected_goals REAL NOT NULL DEFAULT 0.0,
+    expected_assists REAL NOT NULL DEFAULT 0.0,
+    expected_goals_conceded REAL NOT NULL DEFAULT 0.0,
+    PRIMARY KEY (player_id, season_name)
+);
+
+-- One row per player+gameweek for the CURRENT season (see fpl_api.sync_player_history), sourced
+-- from element-summary/{id}/'s history -- the players table only carries a flat cumulative
+-- season-to-date average (xg_per_90 etc.), which is slow to react to a genuine recent role
+-- change (a new penalty taker, a formation switch, returning sharper after injury); this lets
+-- optimizer.recent_form_rate compute a recency-weighted rolling window instead. round is FPL's
+-- own gameweek number for that row (matches gameweeks.id).
+CREATE TABLE IF NOT EXISTS player_gw_history (
+    player_id INTEGER NOT NULL REFERENCES players(id),
+    round INTEGER NOT NULL,
+    minutes INTEGER NOT NULL DEFAULT 0,
+    starts INTEGER NOT NULL DEFAULT 0,
+    expected_goals REAL NOT NULL DEFAULT 0.0,
+    expected_assists REAL NOT NULL DEFAULT 0.0,
+    expected_goals_conceded REAL NOT NULL DEFAULT 0.0,
+    total_points INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (player_id, round)
+);
+
 CREATE TABLE IF NOT EXISTS fixtures (
     id INTEGER PRIMARY KEY,
     event INTEGER REFERENCES gameweeks(id),
@@ -147,6 +186,14 @@ PLAYERS_MIGRATION_COLUMNS = {
     "corners_order": "INTEGER",
     "transfers_in_event": "INTEGER",
     "transfers_out_event": "INTEGER",
+    "expected_goals_conceded_per_90": "REAL",  # per-player xGC, distinct from the team-level FDR
+    # proxy calculate_positional_xp otherwise falls back to -- see _team_xga_proxy's own docstring.
+    "cost_change_event": "INTEGER",  # today's ALREADY-REALIZED price move (not a prediction) --
+    # +1/-1 (or more) once it's actually happened; 0 before/after that day's update.
+    "price_change_percent": "REAL",  # FPL's own undocumented "progress toward the next price
+    # change" signal -- roughly -100..100, sign giving direction and magnitude giving proximity;
+    # empirically a much more direct read than the net-transfers momentum heuristic alone, see
+    # fpl_api.compute_price_change_alerts.
 }
 
 
@@ -194,7 +241,8 @@ def clear_all_data(conn: sqlite3.Connection) -> None:
     app.py's "Sync Live Data" handler.
     """
     for table in (
-        "user_squad", "external_projections", "preseason_adjustments", "fixtures", "players", "gameweeks", "teams",
+        "user_squad", "external_projections", "preseason_adjustments", "player_gw_history",
+        "player_season_history", "fixtures", "players", "gameweeks", "teams",
     ):
         conn.execute(f"DELETE FROM {table}")
     conn.commit()

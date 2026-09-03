@@ -60,17 +60,28 @@ class Player(BaseModel):
     corners_order: Optional[int] = Field(alias="corners_and_indirect_freekicks_order", default=None)
     transfers_in_event: int = 0  # transfers in *today/this event* -- Price Change Sentinel input
     transfers_out_event: int = 0  # transfers out *today/this event* -- Price Change Sentinel input
+    expected_goals_conceded_per_90: float = 0.0  # per-player xGC -- see calculate_positional_xp's
+    # use of this vs. the team-level FDR proxy (_team_xga_proxy)
+    cost_change_event: int = 0  # today's ALREADY-REALIZED price move, not a prediction
+    price_change_percent: float = 0.0  # FPL's own "progress toward next price change" signal --
+    # see compute_price_change_alerts
     status: str
     news: str = ""
 
     @field_validator(
         "selected_by_percent", "form", "xg", "xa", "xgi",
         "xg_per_90", "xa_per_90", "saves_per_90", "defensive_contribution_per_90", "starts_per_90",
+        "expected_goals_conceded_per_90", "price_change_percent",
         mode="before",
     )
     @classmethod
     def _empty_to_zero(cls, v):
         return _to_float(v)
+
+    @field_validator("cost_change_event", mode="before")
+    @classmethod
+    def _empty_to_zero_cost_change(cls, v):
+        return int(_to_float(v))
 
     @field_validator("transfers_in_event", "transfers_out_event", mode="before")
     @classmethod

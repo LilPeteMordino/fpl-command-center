@@ -13,6 +13,8 @@ MANAGER_INFO_URL_TEMPLATE = FPL_BASE_URL + "/entry/{manager_id}/"
 MANAGER_HISTORY_URL_TEMPLATE = FPL_BASE_URL + "/entry/{manager_id}/history/"
 LEAGUE_STANDINGS_URL_TEMPLATE = FPL_BASE_URL + "/leagues-classic/{league_id}/standings/"
 EVENT_LIVE_URL_TEMPLATE = FPL_BASE_URL + "/event/{event}/live/"
+ELEMENT_SUMMARY_URL_TEMPLATE = FPL_BASE_URL + "/element-summary/{player_id}/"  # per-player fixtures
+# + this-season per-gameweek 'history' + prior-seasons' 'history_past' -- see fpl_api.fetch_player_history
 
 # Community-maintained mirror of FPL's own official data (github.com/vaastav/Fantasy-Premier-League).
 # Used only as a fallback data source when fantasy.premierleague.com is unreachable -- verified
